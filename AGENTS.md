@@ -21,6 +21,10 @@ reactor_udp.h        The connectionless transport. reactor::{UdpOptions, Datagra
                      -- one reactor + one bound UDP socket + a receive loop, with the full
                      multicast toolkit (reuse_port, IP_MULTICAST_LOOP/TTL, join a group,
                      SND/RCV buffers). Includes reactor.h (reuses Reactor).
+reactor_events.h     Loop primitives: reactor::PeriodicTimer (ev::timer replacement --
+                     start/again/stop/repeat over steady_timer) + reactor::Signal (ev::async
+                     replacement -- send() posts to the loop, coalescing). For lifting a
+                     single-threaded protocol (gossip/Raft) onto a reactor loop.
 CMakeLists.txt       Header-only INTERFACE target reactor::reactor; fetches standalone
                      Asio (asio-1-36-0) or reuses -DASIO_INCLUDE_DIR; builds the tests
                      only when this repo is top-level.
