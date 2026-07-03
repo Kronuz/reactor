@@ -54,6 +54,31 @@ of each re-writing the accept loop, the offload pool, and the shutdown.
   connection parked on a half-read request or a full queue unwedges and the threads
   join instead of hanging.
 
+## UDP too (`reactor_udp.h`)
+
+The connectionless counterpart, `reactor::UdpServer`, is one reactor owning one bound
+UDP socket and an async receive loop that hands each datagram to a `Datagram` handler.
+It carries the full multicast toolkit a gossip/discovery protocol needs (`reuse_port`
+so N nodes share a port on one host, `IP_MULTICAST_LOOP`, `IP_MULTICAST_TTL`, join a
+group, large SND/RCV buffers). No per-connection Session — UDP is connectionless — and
+the framing is still entirely yours. Its `io()` is exposed so a single-threaded protocol
+runs its own timers on the same loop as the receive (no locking between them).
+
+```cpp
+#include "reactor_udp.h"
+
+reactor::UdpServer disc([](std::string_view data, const asio::ip::udp::endpoint& from) {
+    handle_gossip(data, from);          // runs on the reactor thread, next to your timers
+});
+reactor::UdpOptions o;
+o.multicast_group = "239.192.168.1";
+o.multicast_loop  = true;               // one-host clusters see their own sends
+o.reuse_port      = true;               // N nodes share the port
+disc.set_options(o);
+disc.start(58880);
+disc.send(bytes);                       // to the group
+```
+
 ## Build
 
 ```sh
@@ -65,6 +90,8 @@ Header-only: to use it, add the directory to your include path (or `FetchContent
 this repo) and link `reactor::reactor`. Standalone Asio is fetched at configure time,
 or point `-DASIO_INCLUDE_DIR=/path/to/asio/include` at an existing checkout.
 
-`test/test.cc` is the whole surface end-to-end over real TCP: a line-echo server
-across both bind modes, an offloaded slow request that keeps the reactor free, and a
-`stop()` that unblocks a session parked on an `Abortable`.
+`test/test.cc` is the whole TCP surface end-to-end: a line-echo server across both bind
+modes, an offloaded slow request that keeps the reactor free, and a `stop()` that
+unblocks a session parked on an `Abortable`. `test/udp_test.cc` covers the UDP transport:
+unicast, multicast loopback between two sockets sharing a port, an app timer on the same
+loop, and a clean `stop()`.

@@ -6,20 +6,31 @@ this is the map.
 
 ## One layer, one job
 
-The library is a single header, `reactor.h`, and draws one seam: the **runtime**
-below, the **protocol** above. Everything here is transport mechanics — loops,
-threads, acceptors, offload, shutdown. Nothing here knows a wire format.
+The library is two headers — `reactor.h` (TCP) and `reactor_udp.h` (UDP) — drawing one
+seam: the **runtime** below, the **protocol** above. Everything here is transport
+mechanics — loops, threads, acceptors/sockets, offload, shutdown. Nothing here knows a
+wire format.
 
 ```
-      protocol:  Session = awaitable<void>(socket, Reactor&)   -- you write this
+      protocol:  Session = awaitable<void>(socket, Reactor&)    -- TCP: you write this
+                 Datagram = void(string_view, udp::endpoint)    -- UDP: you write this
      ------------------------------ the seam --------------------------------
   runtime   TcpServer     N reactors on N threads, one port, a Session per connection
+            UdpServer     one reactor, one bound UDP socket, a Datagram per packet
             Reactor       one io_context (one thread) + offload pool + gate + abortables
             OffloadGate   bounded offload admission (shed when full)
             Abortable     something shutdown must release so a blocked worker unwedges
-            BindOptions   address / reuse_port / tcp_nodelay / backlog
+            BindOptions   TCP: address / reuse_port / tcp_nodelay / backlog
+            UdpOptions    UDP: reuse_addr/port, multicast group/interface/loop/ttl, buffers
             detail::accept_loop / shared_accept_loop   the two bind strategies
 ```
+
+The two transports share `Reactor` (the io_context + offload pool + abortable registry)
+and the abort→stop→join shutdown; they differ only in the connection model — TCP accepts
+and spawns a Session coroutine per connection, UDP runs one receive loop and calls the
+Datagram handler per packet. UDP has no accept and no per-connection state, so its
+`UdpServer` is a single reactor (a gossip protocol is single-threaded); it exposes `io()`
+so the protocol's own timers run on that same loop.
 
 ## Runtime: shared-nothing reactors
 
@@ -117,6 +128,39 @@ Anything a Session can block on registers with `Reactor::track()` as an `Abortab
 step 1 calls its `abort()`. `track()` holds `weak_ptr`s and prunes expired entries,
 so a connection that finished normally leaves nothing behind. The destructor calls
 `stop()`, so a `TcpServer` going out of scope tears down cleanly on its own.
+
+## UDP: the connectionless path (`reactor_udp.h`)
+
+`UdpServer` reuses `Reactor` but replaces accept-and-Session with bind-and-receive:
+
+```
+  UdpServer(on_datagram)  ->  one Reactor (io_context + thread)
+      start(port):
+        open + set options (reuse_addr/port, SND/RCV buffers)
+        if multicast:  enable_loopback, ttl, outbound_interface (IP_MULTICAST_IF)
+        bind(port)                 -- THROWS on failure (the app decides what that means)
+        if multicast:  join_group(group[, interface])   -- and remember group:port for send()
+        co_spawn(receive_loop)     -- async_receive_from -> on_datagram(bytes, from), forever
+        run() on the thread
+      send(data)      -> send_to(data, group:port)
+      send_to(d, ep)  -> one datagram to ep
+      stop()          -> abort_all -> io.stop() -> join -> drain pool  (same order as TCP)
+```
+
+Two things are load-bearing and specific to UDP:
+
+- **The datagram handler and the protocol's timers share one thread.** A gossip/Raft
+  protocol keeps a lot of state (terms, votes, peer tables) that a single loop mutates
+  without locks. So `UdpServer` is deliberately one reactor, and it exposes `io()` so the
+  protocol schedules its `steady_timer`s and cross-thread `post`s onto that *same* loop —
+  the receive and the timers never race. `send()`/`send_to()` may be called from any
+  thread (UDP send and receive are independent directions), but a strict-ordering
+  protocol posts its sends onto `io()` too.
+- **Multicast interface selection.** Sending to a group uses the OS's default-route
+  interface unless `multicast_interface` pins `IP_MULTICAST_IF`; a VPN/utun default route
+  frequently can't carry multicast, so pinning the loopback interface keeps a one-host
+  cluster's gossip self-contained. The join uses the same interface. `INADDR_ANY` (the
+  default) matches the classic transport.
 
 ## What lives above (not here)
 
