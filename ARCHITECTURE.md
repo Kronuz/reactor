@@ -4,6 +4,11 @@ How the runtime is put together, and the path a connection takes from a listenin
 port to a Session coroutine. Read `README.md` first for the shape and the rationale;
 this is the map.
 
+![reactor: a connection's life and the offload that keeps the loop free](assets/architecture.svg)
+
+<!-- Diagram: assets/architecture.svg. Edit the D2 source below and re-render with:
+     d2 --theme 0 --pad 20 <this-source>.d2 assets/architecture.svg
+
 ```d2
 # reactor: a connection's life and the offload that keeps the loop free.
 direction: down
@@ -19,6 +24,7 @@ co -> pool: "co_await (blocking IO/CPU)"
 pool -> co: "resume with result"
 co -> c: "write reply"
 ```
+-->
 
 ## Dependencies
 
