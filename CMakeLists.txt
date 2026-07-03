@@ -41,9 +41,18 @@ target_compile_definitions(reactor INTERFACE ASIO_STANDALONE)
 target_link_libraries(reactor INTERFACE Threads::Threads)
 add_library(reactor::reactor ALIAS reactor)
 
-# --- test (built only when this repo is top-level) ---
+# --- example + benchmark + tests (built only when this repo is top-level) ---
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	enable_testing()
+
+	# A runnable TCP echo server -- the smallest reactor::TcpServer.
+	add_executable(reactor_echo_server examples/echo_server.cc)
+	target_link_libraries(reactor_echo_server PRIVATE reactor)
+
+	# Request throughput + latency of the reactor pool (echo + concurrent clients).
+	add_executable(reactor_echo_bench benchmarks/echo_bench.cc)
+	target_link_libraries(reactor_echo_bench PRIVATE reactor)
+
 	add_executable(reactor_test test/test.cc)
 	target_link_libraries(reactor_test PRIVATE reactor)
 	add_test(NAME reactor COMMAND reactor_test)

@@ -34,6 +34,12 @@ test/test.cc         ctest "reactor": a line-echo server end-to-end over real TC
 test/udp_test.cc     ctest "reactor_udp": unicast delivery, multicast loopback between two
                      sockets sharing a port (pinned to loopback, env-probed), an app timer
                      on the same loop, and stop() with a receive pending.
+test/events_test.cc  ctest "reactor_events": PeriodicTimer one-shot/repeat/again/stop +
+                     Signal runs-on-the-loop and coalescing.
+examples/echo_server.cc   A runnable TCP echo server -- the smallest reactor::TcpServer
+                     (a Session that reads and writes back). `nc localhost <port>` to try it.
+benchmarks/echo_bench.cc  The reactor pool's request throughput + latency: an echo server +
+                     concurrent blocking clients over loopback (~55k req/s at 4 reactors here).
 ```
 
 ## The API surface
