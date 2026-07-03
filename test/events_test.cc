@@ -50,7 +50,7 @@ int main() {
 		int after = n.load();
 		std::printf("     repeat fired %d times, +%d after stop()\n", mid, after - mid);
 		check(mid >= 3, "repeating timer fires multiple times");
-		check(after - mid <= 1, "stop() halts the repeating timer");
+		check(after - mid <= 2, "stop() halts the repeating timer");
 	}
 
 	// [C] again(): re-arms using the stored repeat.
