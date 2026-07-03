@@ -79,6 +79,10 @@ disc.start(58880);
 disc.send(bytes);                       // to the group
 ```
 
+## Dependencies
+
+**[asio](https://think-async.com/Asio/)** (standalone, `ASIO_STANDALONE`), pulled in by CMake `FetchContent`; otherwise header-only and standard-library only (C++20 coroutines). The protocol/session and any logging are supplied *above* the runtime, not depended on here.
+
 ## Build
 
 ```sh

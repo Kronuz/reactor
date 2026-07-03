@@ -4,6 +4,29 @@ How the runtime is put together, and the path a connection takes from a listenin
 port to a Session coroutine. Read `README.md` first for the shape and the rationale;
 this is the map.
 
+```d2
+# reactor: a connection's life and the offload that keeps the loop free.
+direction: down
+c: "client" { style.fill: "#faf3e6" }
+acc: "acceptor\n(SO_REUSEPORT: one per reactor, or one round-robin)" { style.fill: "#eef2f7" }
+r: "reactor loop\n(io_context, one thread)" { style.fill: "#e8f5ee" }
+co: "per-connection coroutine\n(reads framed messages)" { style.fill: "#e8f5ee" }
+pool: "offload thread-pool\n(bounded gate; blocking work)" { style.fill: "#eef2f7" }
+c -> acc: "connect"
+acc -> r: "accept"
+r -> co: "co_spawn"
+co -> pool: "co_await (blocking IO/CPU)"
+pool -> co: "resume with result"
+co -> c: "write reply"
+```
+
+## Dependencies
+
+Just **[asio](https://think-async.com/Asio/)** (standalone, `ASIO_STANDALONE`), pulled
+in by CMake `FetchContent`; otherwise header-only and standard-library only. The
+protocol/session, logging, and any application state are supplied *above* the runtime,
+not depended on here (see [What lives above](#what-lives-above-not-here)).
+
 ## One layer, one job
 
 The library is two headers — `reactor.h` (TCP) and `reactor_udp.h` (UDP) — drawing one
