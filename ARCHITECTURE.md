@@ -147,10 +147,11 @@ join. So `stop()` runs a strict order:
 ```
   stop():
     1. reactor.abort_all()   for every reactor  -- release Abortables; blocked workers unwedge
-    2. clear work guards                          -- idle reactors may now drain
-    3. io.stop()             for every reactor    -- stop the loops
-    4. thread.join()         for every thread     -- loops have exited; joins return
-    5. pool.stop() + join()  for every pool        -- drain offload
+    2. close and reap accepts on their owner loops -- all peer socket services remain alive
+    3. clear work guards                          -- idle reactors may now drain
+    4. io.stop()             for every reactor    -- stop the loops
+    5. thread.join()         for every thread     -- loops have exited; joins return
+    6. pool.stop() + join()  for every pool        -- drain offload
 ```
 
 Anything a Session can block on registers with `Reactor::track()` as an `Abortable`;
@@ -197,3 +198,5 @@ The protocol. Message enums and a dispatch switch, framing (`[type][len][payload
 vs an HTTP request line vs a UDP datagram header), file streaming, keep-alive
 policy, the parser and writer — every bit of that is the Session's. This library is
 deliberately the part that is identical across all of them.
+
+Owned accept control records exist before loop threads start. Their completion callbacks retire the acceptor on its owning loop before signaling the stop barrier. A stopping latch prevents another accept iteration or delivery of an accept observed after shutdown. Every reactor remains alive until all controls complete, including early startup and bind failure. `stop()` is an external lifecycle operation; calling it from a reactor thread would deadlock its own completion barrier. Late registered Abortables are released immediately, with callbacks outside the registry lock.

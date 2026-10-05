@@ -101,3 +101,7 @@ unicast, multicast loopback between two sockets sharing a port, an app timer on 
 loop, and a clean `stop()`. `examples/echo_server.cc` (`reactor_echo_server`) is a runnable
 TCP echo server; `benchmarks/echo_bench.cc` (`reactor_echo_bench`) measures the pool's
 request throughput + latency (~55k req/s at 4 reactors on a laptop).
+
+## TCP shutdown ownership
+
+`stop()` runs on an external lifecycle thread. It aborts tracked waits, closes each acceptor on its owning executor and waits for accept-loop completion before stopping any reactor. A shared accept can own a socket backed by another reactor, so cancellation submission alone cannot authorize runtime retirement. Immediate stop, bind failure and repeated stop use the same barrier. Registering a wait after shutdown begins aborts it immediately; abort callbacks run outside the registry mutex. TCP server instances are single-use.

@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "reactor.h"
+#include <future>
 
 static int g_fail = 0;
 static void check(bool ok, const std::string& m) {
@@ -194,6 +195,43 @@ int main() {
 		check(ok, "stop() aborts a session blocked on an Abortable (no shutdown hang)");
 		if (ok) { stopper.join(); delete svc; } else { stopper.detach(); }
 		if (fd >= 0) { ::close(fd); }
+	}
+
+	// Reap a pending shared accept for every round-robin destination.
+	for (unsigned count = 0; count != 5; ++count) {
+		auto port = free_port();
+		reactor::TcpServer service(4, 0, 0, echo_session);
+		service.start(port); wait_listen(port);
+		for (unsigned index = 0; index != count; ++index) { check(round_trip(port, "pending") == "echo: pending", "shared accept destination reached before retirement"); }
+		service.stop(); service.stop();
+	}
+	for (unsigned count = 0; count != 20; ++count) {
+		reactor::TcpServer service(4, 0, 0, echo_session);
+		service.start(free_port()); service.stop();
+	}
+	{
+		struct Reentrant : reactor::Abortable {
+			reactor::Reactor& owner;
+			unsigned calls = 0;
+			explicit Reentrant(reactor::Reactor& value) : owner(value) {}
+			void abort() override { ++calls; owner.abort_all(); }
+		};
+		reactor::Reactor owner(0, 0);
+		auto first = std::make_shared<Reentrant>(owner); owner.track(first); owner.abort_all();
+		auto late = std::make_shared<Reentrant>(owner); owner.track(late);
+		check(first->calls == 1 && late->calls == 1, "shutdown callbacks may reenter and late tracked waits are aborted");
+	}
+	{
+		int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+		sockaddr_in address{}; address.sin_family = AF_INET; address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+		check(::bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0, "reserve occupied bind endpoint");
+		::listen(fd, 1); socklen_t size = sizeof(address); ::getsockname(fd, reinterpret_cast<sockaddr*>(&address), &size);
+		reactor::TcpServer service(4, 0, 0, echo_session);
+		service.start(ntohs(address.sin_port));
+		std::promise<void> attempted; auto completion = attempted.get_future();
+		asio::post(service.reactor(0).io(), [&] { attempted.set_value(); });
+		check(completion.wait_for(std::chrono::seconds(5)) == std::future_status::ready, "bind failure leaves owner alive through accept retirement");
+		service.stop(); ::close(fd);
 	}
 
 	std::printf("\n%s (%d failures)\n", g_fail == 0 ? "PASS" : "FAIL", g_fail);

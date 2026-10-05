@@ -79,7 +79,7 @@ benchmarks/echo_bench.cc  The reactor pool's request throughput + latency: an ec
   blocks, or `stop()` will hang. If you add a new place a Session waits (a queue, a
   condvar, a channel), it needs an `abort()` that releases the wait, and it must be
   registered.
-- **Shutdown order is abort → clear guards → stop → join → drain pool.** Don't reorder;
+- **Shutdown order is latch stopping → abort → close and reap accepts → clear guards → stop → join → drain pool.** Don't reorder;
   each step depends on the previous. See `TcpServer::stop()`.
 - **The shared-acceptor path needs the work guards.** Idle reactors' `run()` returns
   immediately without them. Don't remove the `make_work_guard` loop.
@@ -130,3 +130,5 @@ protocol in the caller's Session/Datagram handler.
   or the runtime's behavior. The docs are part of the deliverable.
 - **Every change stays green under `ctest`.** Add a section to `test/test.cc` for new
   surface (a new bind mode, a UDP server, a new shutdown path).
+
+TCP stop runs on an external lifecycle thread. Accept controls are registered before threads launch and signal completion only after original accept operations are reaped. Keep every reactor alive through that barrier: a shared accept can own a peer socket backed by another reactor. Late tracked waits are aborted immediately, and abort callbacks run outside the registry mutex.

@@ -46,9 +46,11 @@
 #include <atomic>
 #include <cstddef>
 #include <functional>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <stdexcept>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -111,15 +113,26 @@ public:
 
 	// Register an abortable so shutdown can unblock it; prunes expired entries.
 	void track(const std::shared_ptr<Abortable>& a) {
-		std::lock_guard<std::mutex> lk(mtx_);
-		abortables_.erase(std::remove_if(abortables_.begin(), abortables_.end(),
-			[](const std::weak_ptr<Abortable>& w) { return w.expired(); }), abortables_.end());
-		abortables_.push_back(a);
+		bool abort;
+		{
+			std::lock_guard<std::mutex> lock(mtx_);
+			abort = aborting_;
+			if (!abort) {
+				abortables_.erase(std::remove_if(abortables_.begin(), abortables_.end(),
+					[](const std::weak_ptr<Abortable>& w) { return w.expired(); }), abortables_.end());
+				abortables_.push_back(a);
+			}
+		}
+		if (abort) { a->abort(); }
 	}
-	// Abort every live abortable (called at shutdown, before io.stop()).
 	void abort_all() {
-		std::lock_guard<std::mutex> lk(mtx_);
-		for (auto& w : abortables_) { if (auto a = w.lock()) { a->abort(); } }
+		std::vector<std::weak_ptr<Abortable>> pending;
+		{
+			std::lock_guard<std::mutex> lock(mtx_);
+			aborting_ = true;
+			pending.swap(abortables_);
+		}
+		for (auto& weak : pending) { if (auto value = weak.lock()) { value->abort(); } }
 	}
 
 private:
@@ -127,6 +140,7 @@ private:
 	std::unique_ptr<asio::thread_pool> pool_;
 	OffloadGate gate_;
 	std::mutex mtx_;
+	bool aborting_ = false;
 	std::vector<std::weak_ptr<Abortable>> abortables_;
 };
 
@@ -136,12 +150,33 @@ using Session = std::function<asio::awaitable<void>(asio::ip::tcp::socket, React
 
 namespace detail {
 
+// Accept-loop completion is the retirement barrier for cross-reactor peer sockets.
+struct AcceptControl {
+	explicit AcceptControl(asio::io_context& io) : executor(io.get_executor()), acceptor(std::make_unique<asio::ip::tcp::acceptor>(io)) {}
+	asio::io_context::executor_type executor;
+	std::unique_ptr<asio::ip::tcp::acceptor> acceptor;
+	std::atomic<bool> stopping{false};
+	std::mutex mutex;
+	std::condition_variable changed;
+	bool finished = false;
+	void finish() {
+		acceptor.reset(); // owner executor; no socket object can escape runtime retirement
+		{ std::lock_guard lock(mutex); finished = true; }
+		changed.notify_all();
+	}
+	void wait() {
+		std::unique_lock lock(mutex);
+		changed.wait(lock, [&] { return finished; });
+	}
+};
+
 // SO_REUSEPORT path: each reactor binds its own acceptor and the kernel load-balances.
 inline asio::awaitable<void> accept_loop(Reactor* reactor, const Session* session,
-                                         unsigned short port, BindOptions bind) {
+                                         unsigned short port, BindOptions bind, std::shared_ptr<AcceptControl> control) {
 	using asio::ip::tcp;
 	auto ex = co_await asio::this_coro::executor;
-	tcp::acceptor acceptor(ex);
+	if (control->stopping.load()) { co_return; }
+	auto& acceptor = *control->acceptor;
 	tcp::endpoint ep = bind.address.empty()
 		? tcp::endpoint(tcp::v4(), port)
 		: tcp::endpoint(asio::ip::make_address(bind.address), port);
@@ -150,8 +185,9 @@ inline asio::awaitable<void> accept_loop(Reactor* reactor, const Session* sessio
 	if (bind.reuse_port) { acceptor.set_option(reuse_port_option(true)); }
 	acceptor.bind(ep);
 	acceptor.listen(bind.backlog);
-	for (;;) {
+	while (!control->stopping.load()) {
 		tcp::socket socket = co_await acceptor.async_accept(asio::use_awaitable);
+		if (control->stopping.load()) { co_return; }
 		asio::co_spawn(ex, (*session)(std::move(socket), *reactor), asio::detached);
 	}
 }
@@ -163,10 +199,11 @@ inline asio::awaitable<void> accept_loop(Reactor* reactor, const Session* sessio
 // same-port bind without SO_REUSEPORT, so N independent acceptors are a Linux-only
 // optimization; this is the portable default.
 inline asio::awaitable<void> shared_accept_loop(std::vector<Reactor*> reactors, const Session* session,
-                                                unsigned short port, BindOptions bind) {
+                                                unsigned short port, BindOptions bind, std::shared_ptr<AcceptControl> control) {
 	using asio::ip::tcp;
 	auto ex = co_await asio::this_coro::executor;
-	tcp::acceptor acceptor(ex);
+	if (control->stopping.load()) { co_return; }
+	auto& acceptor = *control->acceptor;
 	tcp::endpoint ep = bind.address.empty()
 		? tcp::endpoint(tcp::v4(), port)
 		: tcp::endpoint(asio::ip::make_address(bind.address), port);
@@ -175,10 +212,11 @@ inline asio::awaitable<void> shared_accept_loop(std::vector<Reactor*> reactors, 
 	acceptor.bind(ep);
 	acceptor.listen(bind.backlog);
 	std::size_t next = 0;
-	for (;;) {
+	while (!control->stopping.load()) {
 		Reactor* r = reactors[next];
 		next = (next + 1 == reactors.size()) ? 0 : next + 1;
 		tcp::socket socket = co_await acceptor.async_accept(r->io(), asio::use_awaitable);
+		if (control->stopping.load()) { co_return; }
 		asio::co_spawn(r->io(), (*session)(std::move(socket), *r), asio::detached);
 	}
 }
@@ -212,40 +250,60 @@ public:
 	// Bind + run all reactors (each on its own thread). Returns once the threads are
 	// launched; stop() tears down.
 	void start(unsigned short port) {
+		if (started_) { throw std::logic_error("TCP server cannot be restarted"); }
+		started_ = true;
+		try {
 		bool shared = !bind_.reuse_port && reactors_.size() > 1;
-		if (!shared) {
-			for (auto& r : reactors_) {
-				Reactor* rp = r.get();
-				threads_.emplace_back([this, rp, port] {
-					asio::co_spawn(rp->io(), detail::accept_loop(rp, &session_, port, bind_), asio::detached);
-					rp->io().run();
-				});
-			}
-			return;
-		}
-		std::vector<Reactor*> raw;
-		raw.reserve(reactors_.size());
-		for (auto& r : reactors_) { raw.push_back(r.get()); }
-		// Idle reactors (all but the acceptor's) have no pending work yet; a work guard
-		// keeps run() blocked until stop() instead of returning immediately.
+		// Register controls and guards before launching any thread, including immediate stop.
 		for (auto& r : reactors_) { guards_.emplace_back(asio::make_work_guard(r->io())); }
-		for (auto& r : reactors_) {
-			Reactor* rp = r.get();
-			threads_.emplace_back([rp] { rp->io().run(); });
+		if (shared) {
+			std::vector<Reactor*> raw;
+			for (auto& r : reactors_) { raw.push_back(r.get()); }
+			auto control = std::make_shared<detail::AcceptControl>(reactors_[0]->io());
+			accepts_.push_back(control);
+			try { asio::co_spawn(control->executor, detail::shared_accept_loop(raw, &session_, port, bind_, control),
+				[control](std::exception_ptr) { control->finish(); }); } catch (...) { control->finish(); throw; }
+		} else {
+			for (auto& r : reactors_) {
+				auto control = std::make_shared<detail::AcceptControl>(r->io());
+				accepts_.push_back(control);
+				try { asio::co_spawn(control->executor, detail::accept_loop(r.get(), &session_, port, bind_, control),
+					[control](std::exception_ptr) { control->finish(); }); } catch (...) { control->finish(); throw; }
+			}
 		}
-		asio::co_spawn(raw[0]->io(), detail::shared_accept_loop(raw, &session_, port, bind_), asio::detached);
+		for (auto& r : reactors_) { Reactor* rp = r.get(); threads_.emplace_back([rp] { rp->io().run(); }); }
+		} catch (...) {
+			for (auto& control : accepts_) { control->stopping.store(true); }
+			// No loop thread owns these contexts yet. Finish canceled startup work
+			// here if thread creation or coroutine initiation failed partway through.
+			for (std::size_t i = threads_.size(); i < reactors_.size(); ++i) { reactors_[i]->io().poll(); }
+			stop();
+			throw;
+		}
 	}
 
 	void stop() {
 		for (auto& r : reactors_) { r->abort_all(); }   // unblock any worker stuck mid-request
+		for (auto& control : accepts_) {
+			control->stopping.store(true);
+			asio::post(control->executor, [control] {
+				if (control->acceptor) { asio::error_code error; control->acceptor->close(error); }
+			});
+		}
+		// Cancel submission is not completion. Reap every accept while all peer
+		// socket services remain alive, then preserve the existing shutdown tail.
+		for (auto& control : accepts_) { control->wait(); }
 		guards_.clear();
 		for (auto& r : reactors_) { r->io().stop(); }
 		for (auto& t : threads_) { if (t.joinable()) { t.join(); } }
 		threads_.clear();
 		for (auto& r : reactors_) { if (r->pool()) { r->pool()->stop(); r->pool()->join(); } }
+		accepts_.clear();
 	}
 
 private:
+	bool started_ = false;
+	std::vector<std::shared_ptr<detail::AcceptControl>> accepts_;
 	std::size_t n_;
 	Session session_;
 	BindOptions bind_{};
