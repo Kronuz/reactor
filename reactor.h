@@ -38,6 +38,8 @@
 #pragma once
 
 #include <asio.hpp>
+#include "connection_admission.h"
+#include <chrono>
 
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -160,14 +162,18 @@ private:
 // The per-connection coroutine: given an accepted socket and its reactor, serve the
 // connection to completion. The protocol lives entirely here.
 using Session = std::function<asio::awaitable<void>(asio::ip::tcp::socket, Reactor&)>;
+struct SessionContext { std::chrono::steady_clock::time_point accepted_at; };
+using TimedSession = std::function<asio::awaitable<void>(asio::ip::tcp::socket, Reactor&, SessionContext)>;
 
 namespace detail {
 
 // Shutdown retains each original coroutine until its completion handler runs.
 struct SessionControl : Abortable, std::enable_shared_from_this<SessionControl> {
-	explicit SessionControl(Reactor& owner) : reactor(owner) { reactor.session_started(); }
+	explicit SessionControl(Reactor& owner, ConnectionAdmission::Lease admitted)
+		: reactor(owner), admission(std::move(admitted)) { reactor.session_started(); }
 	~SessionControl() { finish(); }
 	Reactor& reactor;
+	ConnectionAdmission::Lease admission;
 	asio::cancellation_signal cancellation;
 	std::atomic<bool> finished{false};
 	std::atomic<bool> aborted{false};
@@ -179,19 +185,20 @@ struct SessionControl : Abortable, std::enable_shared_from_this<SessionControl> 
 		});
 	}
 	void finish() {
-		if (!finished.exchange(true)) { reactor.session_finished(); }
+		if (!finished.exchange(true)) { admission.reset(); reactor.session_finished(); }
 	}
 };
-inline void launch_session(Reactor& reactor, const Session& session, asio::ip::tcp::socket socket) {
-	auto control = std::make_shared<SessionControl>(reactor);
+inline void launch_session(Reactor& reactor, const TimedSession& session, asio::ip::tcp::socket socket,
+	SessionContext context, ConnectionAdmission::Lease admission) {
+	auto control = std::make_shared<SessionControl>(reactor, std::move(admission));
 	try {
 		// Install the slot and register abortability on the destination owner.
 		// The control is counted before posting, so the accept barrier covers it.
-		asio::post(reactor.io(), [control, &session, socket = std::move(socket)]() mutable {
+		asio::post(reactor.io(), [control, &session, context, socket = std::move(socket)]() mutable {
 			try {
 				control->reactor.track(control);
-				if (control->aborted.load()) { control->finish(); return; }
-				asio::co_spawn(control->reactor.io(), session(std::move(socket), control->reactor),
+				if (control->aborted.load()) { asio::error_code error; socket.close(error); control->finish(); return; }
+				asio::co_spawn(control->reactor.io(), session(std::move(socket), control->reactor, context),
 					asio::bind_cancellation_slot(control->cancellation.slot(),
 						[control](std::exception_ptr) { control->finish(); }));
 			} catch (...) { control->finish(); }
@@ -233,8 +240,8 @@ struct AcceptControl {
 };
 
 // SO_REUSEPORT path: each reactor binds its own acceptor and the kernel load-balances.
-inline asio::awaitable<void> accept_loop(Reactor* reactor, const Session* session,
-                                         unsigned short port, BindOptions bind, std::shared_ptr<AcceptControl> control) {
+inline asio::awaitable<void> accept_loop(Reactor* reactor, const TimedSession* session,
+                                         unsigned short port, BindOptions bind, std::shared_ptr<AcceptControl> control, std::shared_ptr<ConnectionAdmission> admission) {
 	using asio::ip::tcp;
 	auto ex = co_await asio::this_coro::executor;
 	if (control->stopping.load()) { co_return; }
@@ -251,7 +258,10 @@ inline asio::awaitable<void> accept_loop(Reactor* reactor, const Session* sessio
 	while (!control->stopping.load()) {
 		tcp::socket socket = co_await acceptor.async_accept(asio::use_awaitable);
 		if (control->stopping.load()) { co_return; }
-		launch_session(*reactor, *session, std::move(socket));
+		auto context = SessionContext{std::chrono::steady_clock::now()};
+		std::optional<ConnectionAdmission::Lease> lease;
+		if (admission) { lease = admission->try_enter(); if (!lease) { continue; } }
+		launch_session(*reactor, *session, std::move(socket), context, lease ? std::move(*lease) : ConnectionAdmission::Lease{});
 	}
 }
 
@@ -261,8 +271,8 @@ inline asio::awaitable<void> accept_loop(Reactor* reactor, const Session* sessio
 // funnels while the connection's work shards across reactors. macOS/BSD reject a second
 // same-port bind without SO_REUSEPORT, so N independent acceptors are a Linux-only
 // optimization; this is the portable default.
-inline asio::awaitable<void> shared_accept_loop(std::vector<Reactor*> reactors, const Session* session,
-                                                unsigned short port, BindOptions bind, std::shared_ptr<AcceptControl> control) {
+inline asio::awaitable<void> shared_accept_loop(std::vector<Reactor*> reactors, const TimedSession* session,
+                                                unsigned short port, BindOptions bind, std::shared_ptr<AcceptControl> control, std::shared_ptr<ConnectionAdmission> admission) {
 	using asio::ip::tcp;
 	auto ex = co_await asio::this_coro::executor;
 	if (control->stopping.load()) { co_return; }
@@ -281,7 +291,10 @@ inline asio::awaitable<void> shared_accept_loop(std::vector<Reactor*> reactors, 
 		next = (next + 1 == reactors.size()) ? 0 : next + 1;
 		tcp::socket socket = co_await acceptor.async_accept(r->io(), asio::use_awaitable);
 		if (control->stopping.load()) { co_return; }
-		launch_session(*r, *session, std::move(socket));
+		auto context = SessionContext{std::chrono::steady_clock::now()};
+		std::optional<ConnectionAdmission::Lease> lease;
+		if (admission) { lease = admission->try_enter(); if (!lease) { continue; } }
+		launch_session(*r, *session, std::move(socket), context, lease ? std::move(*lease) : ConnectionAdmission::Lease{});
 	}
 }
 
@@ -295,7 +308,14 @@ inline asio::awaitable<void> shared_accept_loop(std::vector<Reactor*> reactors, 
 class TcpServer {
 public:
 	TcpServer(std::size_t reactors, std::size_t workers, int queue_limit, Session session)
+		: TcpServer(reactors, workers, queue_limit, TimedSession{
+			[session = std::move(session)](asio::ip::tcp::socket socket, Reactor& reactor, SessionContext) {
+				return session(std::move(socket), reactor);
+			}}, 0) {}
+	TcpServer(std::size_t reactors, std::size_t workers, int queue_limit, TimedSession session,
+		std::size_t maximum_connections)
 		: n_(reactors != 0 ? reactors : 1), session_(std::move(session)) {
+		set_connection_limit(maximum_connections);
 		for (std::size_t i = 0; i < n_; ++i) {
 			reactors_.push_back(std::make_unique<Reactor>(workers, queue_limit));
 		}
@@ -307,6 +327,11 @@ public:
 	TcpServer& operator=(const TcpServer&) = delete;
 
 	void set_bind_options(const BindOptions& options) { bind_ = options; }
+	void set_connection_limit(std::size_t maximum) {
+		if (started_) { throw std::logic_error("connection bound must be set before startup"); }
+		admission_ = maximum ? std::make_shared<ConnectionAdmission>(maximum) : nullptr;
+	}
+	ConnectionStats connection_stats() const noexcept { return admission_ ? admission_->stats() : ConnectionStats{}; }
 
 	std::size_t reactors() const { return n_; }
 	Reactor& reactor(std::size_t i) { return *reactors_[i]; }
@@ -327,13 +352,13 @@ public:
 			for (auto& r : reactors_) { raw.push_back(r.get()); }
 			auto control = std::make_shared<detail::AcceptControl>(reactors_[0]->io());
 			accepts_.push_back(control);
-			try { asio::co_spawn(control->executor, detail::shared_accept_loop(raw, &session_, port, bind_, control),
+			try { asio::co_spawn(control->executor, detail::shared_accept_loop(raw, &session_, port, bind_, control, admission_),
 				[control](std::exception_ptr error) { control->finish(error); }); } catch (...) { control->finish(); throw; }
 		} else {
 			for (auto& r : reactors_) {
 				auto control = std::make_shared<detail::AcceptControl>(r->io());
 				accepts_.push_back(control);
-				try { asio::co_spawn(control->executor, detail::accept_loop(r.get(), &session_, port, bind_, control),
+				try { asio::co_spawn(control->executor, detail::accept_loop(r.get(), &session_, port, bind_, control, admission_),
 					[control](std::exception_ptr error) { control->finish(error); }); } catch (...) { control->finish(); throw; }
 			}
 		}
@@ -372,7 +397,8 @@ private:
 	bool started_ = false;
 	std::vector<std::shared_ptr<detail::AcceptControl>> accepts_;
 	std::size_t n_;
-	Session session_;
+	TimedSession session_;
+	std::shared_ptr<ConnectionAdmission> admission_;
 	BindOptions bind_{};
 	std::vector<std::unique_ptr<Reactor>> reactors_;
 	std::vector<std::thread> threads_;

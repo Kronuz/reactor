@@ -126,6 +126,68 @@ static int serve_count(unsigned short port, int n) {
 	return ok;
 }
 
+static void bounded_queued_connections() {
+	// The accepting executor stays available while the other destination is
+	// deliberately stalled. Queued originals must already consume admission.
+	auto counts = std::make_shared<RetirementCounts>();
+	reactor::TcpServer service(2, 0, 0, [counts](asio::ip::tcp::socket socket, reactor::Reactor&) {
+		return idle_session(std::move(socket), counts);
+	});
+	service.set_connection_limit(2);
+	reactor::BindOptions bind; bind.address = "127.0.0.1"; service.set_bind_options(bind);
+	auto port = free_port(); service.start(port);
+	std::promise<void> entered, release;
+	auto released = release.get_future().share();
+	asio::post(service.reactor(1).io(), [&] { entered.set_value(); released.wait(); });
+	entered.get_future().wait();
+	std::vector<int> clients;
+	for (unsigned i = 0; i < 64; ++i) { clients.push_back(connect_port(port)); }
+	auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+	while (service.connection_stats().rejected < 62 && std::chrono::steady_clock::now() < deadline) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	}
+	auto queued = service.connection_stats();
+	check(queued.accepted == 2 && queued.active == 2 && queued.high_water == 2 && queued.rejected == 62,
+		"global admission includes sessions queued on a blocked destination");
+	check(counts->started == 1, "queued connection holds a lease before its protocol starts");
+	release.set_value(); service.stop();
+	check(service.connection_stats().active == 0, "shutdown refunds queued and running original leases exactly once");
+	for (auto fd : clients) { if (fd >= 0) ::close(fd); }
+}
+static void bounded_shared_acceptors() {
+	for (bool reuse : {false, true}) {
+		auto counts = std::make_shared<RetirementCounts>();
+		reactor::TcpServer service(4, 0, 0, [counts](asio::ip::tcp::socket socket, reactor::Reactor&) {
+			return idle_session(std::move(socket), counts);
+		});
+		service.set_connection_limit(3);
+		reactor::BindOptions bind; bind.address = "127.0.0.1"; bind.reuse_port = reuse; service.set_bind_options(bind);
+		auto port = free_port(); service.start(port);
+		std::vector<int> clients;
+		for (unsigned i = 0; i < 64; ++i) { clients.push_back(connect_port(port)); }
+		auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+		while (service.connection_stats().rejected < 61 && std::chrono::steady_clock::now() < deadline) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		}
+		auto pressure = service.connection_stats();
+		check(pressure.active == 3 && pressure.high_water == 3 && pressure.accepted == 3 && pressure.rejected == 61,
+			"one global cap covers all shared and reuse-port acceptors");
+		for (auto fd : clients) { if (fd >= 0) ::close(fd); }
+		deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+		while (service.connection_stats().active && std::chrono::steady_clock::now() < deadline) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		}
+		check(service.connection_stats().active == 0, "normal peer close refunds original serving leases");
+		service.stop();
+	}
+	reactor::ConnectionAdmission gate(1);
+	auto first = gate.try_enter(); check(first && !gate.try_enter(), "lease reserves exactly one admission credit");
+	auto moved = std::move(*first); first.reset();
+	check(gate.stats().active == 1, "moving a lease preserves its exact credit");
+	moved.reset(); moved.reset();
+	check(gate.stats().active == 0 && gate.try_enter().has_value(), "double release cannot refund another lease");
+}
+
 int main() {
 	std::printf("== reactor runtime test ==\n");
 
@@ -274,6 +336,7 @@ int main() {
 			"stop reaps original idle reads and session callbacks before returning");
 		for (auto fd : clients) { if (fd >= 0) ::close(fd); }
 	}
+	bounded_queued_connections(); bounded_shared_acceptors();
 	std::printf("\n%s (%d failures)\n", g_fail == 0 ? "PASS" : "FAIL", g_fail);
 	return g_fail == 0 ? 0 : 1;
 }
