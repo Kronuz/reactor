@@ -134,6 +134,8 @@ static void bounded_queued_connections() {
 		return idle_session(std::move(socket), counts);
 	});
 	service.set_connection_limit(2);
+	auto observer = service.connection_observer();
+	check(observer && observer->stats().active == 0, "shared observer starts with no original sessions");
 	reactor::BindOptions bind; bind.address = "127.0.0.1"; service.set_bind_options(bind);
 	auto port = free_port(); service.start(port);
 	std::promise<void> entered, release;
@@ -152,6 +154,7 @@ static void bounded_queued_connections() {
 	check(counts->started == 1, "queued connection holds a lease before its protocol starts");
 	release.set_value(); service.stop();
 	check(service.connection_stats().active == 0, "shutdown refunds queued and running original leases exactly once");
+	check(observer->stats().active == 0 && observer->stats().accepted == 2, "observer retains the same drained admission state");
 	for (auto fd : clients) { if (fd >= 0) ::close(fd); }
 }
 static void bounded_shared_acceptors() {

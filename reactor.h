@@ -332,6 +332,8 @@ public:
 		admission_ = maximum ? std::make_shared<ConnectionAdmission>(maximum) : nullptr;
 	}
 	ConnectionStats connection_stats() const noexcept { return admission_ ? admission_->stats() : ConnectionStats{}; }
+	// Capture before startup; the observer remains valid after server destruction.
+	std::shared_ptr<const ConnectionAdmission> connection_observer() const noexcept { return admission_; }
 
 	std::size_t reactors() const { return n_; }
 	Reactor& reactor(std::size_t i) { return *reactors_[i]; }
