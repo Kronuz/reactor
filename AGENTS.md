@@ -132,3 +132,5 @@ protocol in the caller's Session/Datagram handler.
   surface (a new bind mode, a UDP server, a new shutdown path).
 
 TCP stop runs on an external lifecycle thread. Accept controls are registered before threads launch and signal completion only after original accept operations are reaped. Keep every reactor alive through that barrier: a shared accept can own a peer socket backed by another reactor. Late tracked waits are aborted immediately, and abort callbacks run outside the registry mutex.
+
+TCP `start(port)` now waits for every selected acceptor to bind and listen. Bind/listen failures propagate to the lifecycle caller after original accepts and sessions retire. This corrects the previous asynchronous readiness behavior: callers no longer need listener retries after a successful start, and must handle startup exceptions for occupied or invalid endpoints. The Session signature and constructor APIs remain unchanged.

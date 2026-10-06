@@ -207,10 +207,23 @@ struct AcceptControl {
 	std::atomic<bool> stopping{false};
 	std::mutex mutex;
 	std::condition_variable changed;
-	bool finished = false;
-	void finish() {
+	bool finished = false, ready = false;
+	std::exception_ptr startup_error;
+	void listening() {
+		{ std::lock_guard lock(mutex); ready = true; }
+		changed.notify_all();
+	}
+	void wait_listening() {
+		std::unique_lock lock(mutex);
+		changed.wait(lock, [&] { return ready || finished; });
+		if (!ready) {
+			if (startup_error) std::rethrow_exception(startup_error);
+			throw std::runtime_error("TCP listener stopped during startup");
+		}
+	}
+	void finish(std::exception_ptr error = {}) {
 		acceptor.reset(); // owner executor; no socket object can escape runtime retirement
-		{ std::lock_guard lock(mutex); finished = true; }
+		{ std::lock_guard lock(mutex); startup_error = error; finished = true; }
 		changed.notify_all();
 	}
 	void wait() {
@@ -234,6 +247,7 @@ inline asio::awaitable<void> accept_loop(Reactor* reactor, const Session* sessio
 	if (bind.reuse_port) { acceptor.set_option(reuse_port_option(true)); }
 	acceptor.bind(ep);
 	acceptor.listen(bind.backlog);
+	control->listening();
 	while (!control->stopping.load()) {
 		tcp::socket socket = co_await acceptor.async_accept(asio::use_awaitable);
 		if (control->stopping.load()) { co_return; }
@@ -260,6 +274,7 @@ inline asio::awaitable<void> shared_accept_loop(std::vector<Reactor*> reactors, 
 	acceptor.set_option(tcp::acceptor::reuse_address(true));
 	acceptor.bind(ep);
 	acceptor.listen(bind.backlog);
+	control->listening();
 	std::size_t next = 0;
 	while (!control->stopping.load()) {
 		Reactor* r = reactors[next];
@@ -275,7 +290,7 @@ inline asio::awaitable<void> shared_accept_loop(std::vector<Reactor*> reactors, 
 // A TCP server: N reactors on N threads, all bound to one port, running the Session
 // coroutine per accepted connection. Construct it with the reactor count, the per-reactor
 // offload worker count (0 => inline), the offload admission window, and the Session; set
-// bind options; start(port) launches the threads and returns; stop() (also the dtor)
+// bind options; start(port) returns after all listeners are bound; stop() (also the dtor)
 // aborts in-flight work, stops the loops, and joins.
 class TcpServer {
 public:
@@ -297,7 +312,7 @@ public:
 	Reactor& reactor(std::size_t i) { return *reactors_[i]; }
 
 	// Bind + run all reactors (each on its own thread). Returns once the threads are
-	// launched; stop() tears down.
+	// listening; bind/listen errors propagate after cleanup. stop() tears down.
 	void start(unsigned short port) {
 		if (started_) { throw std::logic_error("TCP server cannot be restarted"); }
 		started_ = true;
@@ -313,15 +328,16 @@ public:
 			auto control = std::make_shared<detail::AcceptControl>(reactors_[0]->io());
 			accepts_.push_back(control);
 			try { asio::co_spawn(control->executor, detail::shared_accept_loop(raw, &session_, port, bind_, control),
-				[control](std::exception_ptr) { control->finish(); }); } catch (...) { control->finish(); throw; }
+				[control](std::exception_ptr error) { control->finish(error); }); } catch (...) { control->finish(); throw; }
 		} else {
 			for (auto& r : reactors_) {
 				auto control = std::make_shared<detail::AcceptControl>(r->io());
 				accepts_.push_back(control);
 				try { asio::co_spawn(control->executor, detail::accept_loop(r.get(), &session_, port, bind_, control),
-					[control](std::exception_ptr) { control->finish(); }); } catch (...) { control->finish(); throw; }
+					[control](std::exception_ptr error) { control->finish(error); }); } catch (...) { control->finish(); throw; }
 			}
 		}
+		for (auto& control : accepts_) { control->wait_listening(); }
 		} catch (...) {
 			for (auto& control : accepts_) { control->stopping.store(true); }
 			// Unstarted contexts cannot have admitted sessions. Drain any queued

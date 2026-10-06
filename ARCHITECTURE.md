@@ -200,3 +200,5 @@ policy, the parser and writer — every bit of that is the Session's. This libra
 deliberately the part that is identical across all of them.
 
 Owned accept control records exist before loop threads start. Their completion callbacks retire the acceptor on its owning loop before signaling the stop barrier. A stopping latch prevents another accept iteration or delivery of an accept observed after shutdown. Every reactor remains alive until all controls complete, including early startup and bind failure. `stop()` is an external lifecycle operation; calling it from a reactor thread would deadlock its own completion barrier. Late registered Abortables are released immediately, with callbacks outside the registry lock.
+
+TCP `start(port)` now waits for every selected acceptor to bind and listen. Bind/listen failures propagate to the lifecycle caller after original accepts and sessions retire. This corrects the previous asynchronous readiness behavior: callers no longer need listener retries after a successful start, and must handle startup exceptions for occupied or invalid endpoints. The Session signature and constructor APIs remain unchanged.

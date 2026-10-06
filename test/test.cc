@@ -237,13 +237,26 @@ int main() {
 		check(::bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0, "reserve occupied bind endpoint");
 		::listen(fd, 1); socklen_t size = sizeof(address); ::getsockname(fd, reinterpret_cast<sockaddr*>(&address), &size);
 		reactor::TcpServer service(4, 0, 0, echo_session);
-		service.start(ntohs(address.sin_port));
-		std::promise<void> attempted; auto completion = attempted.get_future();
-		asio::post(service.reactor(0).io(), [&] { attempted.set_value(); });
-		check(completion.wait_for(std::chrono::seconds(5)) == std::future_status::ready, "bind failure leaves owner alive through accept retirement");
+		reactor::BindOptions bind; bind.address = "127.0.0.1"; service.set_bind_options(bind);
+		bool failed = false;
+		try { service.start(ntohs(address.sin_port)); }
+		catch (const std::system_error&) { failed = true; }
+		check(failed, "occupied listener fails startup and retires original accepts");
 		service.stop(); ::close(fd);
 	}
 
+	for (auto reactors : {1u, 4u}) {
+		for (bool reuse : {false, true}) {
+			reactor::TcpServer service(reactors, 0, 0, echo_session);
+			reactor::BindOptions bind; bind.address = "127.0.0.1"; bind.reuse_port = reuse;
+			service.set_bind_options(bind);
+			const auto port = free_port(); service.start(port);
+			asio::io_context io; asio::ip::tcp::socket socket(io); asio::error_code error;
+			socket.connect({asio::ip::address_v4::loopback(), port}, error);
+			check(!error, "start returns only after a listener accepts immediate connections");
+			socket.close(); service.stop();
+		}
+	}
 	for (auto reactors : {1u, 4u}) {
 		auto counts = std::make_shared<RetirementCounts>();
 		reactor::TcpServer service(reactors, 0, 0,

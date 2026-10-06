@@ -109,3 +109,5 @@ request throughput + latency (~55k req/s at 4 reactors on a laptop).
 ### Original session completion at shutdown
 
 TCP shutdown latches cancellation for each counted session, retires the accept loops, and waits for original session completion while reactor loops and worker pools remain alive. Admission begins after every destination reactor thread has launched. Protocol cleanup must reap its child operations before returning; the runtime barrier counts that return. Call `stop()` from an external thread, since waiting from a reactor or its pool would block the work being retired. Existing constructor and Session APIs remain unchanged.
+
+TCP `start(port)` now waits for every selected acceptor to bind and listen. Bind/listen failures propagate to the lifecycle caller after original accepts and sessions retire. This corrects the previous asynchronous readiness behavior: callers no longer need listener retries after a successful start, and must handle startup exceptions for occupied or invalid endpoints. The Session signature and constructor APIs remain unchanged.
