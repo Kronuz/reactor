@@ -134,6 +134,16 @@ public:
 		}
 		for (auto& weak : pending) { if (auto value = weak.lock()) { value->abort(); } }
 	}
+	void session_started() { std::lock_guard lock(session_mutex_); ++sessions_; }
+	void session_finished() {
+		{ std::lock_guard lock(session_mutex_); --sessions_; }
+		session_changed_.notify_all();
+	}
+	void wait_sessions() {
+		std::unique_lock lock(session_mutex_);
+		session_changed_.wait(lock, [&] { return sessions_ == 0; });
+	}
+	bool stopping() { std::lock_guard lock(mtx_); return aborting_; }
 
 private:
 	asio::io_context io_{1};
@@ -142,6 +152,9 @@ private:
 	std::mutex mtx_;
 	bool aborting_ = false;
 	std::vector<std::weak_ptr<Abortable>> abortables_;
+	std::mutex session_mutex_;
+	std::condition_variable session_changed_;
+	std::size_t sessions_ = 0;
 };
 
 // The per-connection coroutine: given an accepted socket and its reactor, serve the
@@ -149,6 +162,42 @@ private:
 using Session = std::function<asio::awaitable<void>(asio::ip::tcp::socket, Reactor&)>;
 
 namespace detail {
+
+// Shutdown retains each original coroutine until its completion handler runs.
+struct SessionControl : Abortable, std::enable_shared_from_this<SessionControl> {
+	explicit SessionControl(Reactor& owner) : reactor(owner) { reactor.session_started(); }
+	~SessionControl() { finish(); }
+	Reactor& reactor;
+	asio::cancellation_signal cancellation;
+	std::atomic<bool> finished{false};
+	std::atomic<bool> aborted{false};
+	void abort() override {
+		aborted.store(true);
+		auto owner = shared_from_this();
+		asio::post(reactor.io(), [owner] {
+			if (!owner->finished.load()) { owner->cancellation.emit(asio::cancellation_type::all); }
+		});
+	}
+	void finish() {
+		if (!finished.exchange(true)) { reactor.session_finished(); }
+	}
+};
+inline void launch_session(Reactor& reactor, const Session& session, asio::ip::tcp::socket socket) {
+	auto control = std::make_shared<SessionControl>(reactor);
+	try {
+		// Install the slot and register abortability on the destination owner.
+		// The control is counted before posting, so the accept barrier covers it.
+		asio::post(reactor.io(), [control, &session, socket = std::move(socket)]() mutable {
+			try {
+				control->reactor.track(control);
+				if (control->aborted.load()) { control->finish(); return; }
+				asio::co_spawn(control->reactor.io(), session(std::move(socket), control->reactor),
+					asio::bind_cancellation_slot(control->cancellation.slot(),
+						[control](std::exception_ptr) { control->finish(); }));
+			} catch (...) { control->finish(); }
+		});
+	} catch (...) { control->finish(); throw; }
+}
 
 // Accept-loop completion is the retirement barrier for cross-reactor peer sockets.
 struct AcceptControl {
@@ -188,7 +237,7 @@ inline asio::awaitable<void> accept_loop(Reactor* reactor, const Session* sessio
 	while (!control->stopping.load()) {
 		tcp::socket socket = co_await acceptor.async_accept(asio::use_awaitable);
 		if (control->stopping.load()) { co_return; }
-		asio::co_spawn(ex, (*session)(std::move(socket), *reactor), asio::detached);
+		launch_session(*reactor, *session, std::move(socket));
 	}
 }
 
@@ -217,7 +266,7 @@ inline asio::awaitable<void> shared_accept_loop(std::vector<Reactor*> reactors, 
 		next = (next + 1 == reactors.size()) ? 0 : next + 1;
 		tcp::socket socket = co_await acceptor.async_accept(r->io(), asio::use_awaitable);
 		if (control->stopping.load()) { co_return; }
-		asio::co_spawn(r->io(), (*session)(std::move(socket), *r), asio::detached);
+		launch_session(*r, *session, std::move(socket));
 	}
 }
 
@@ -256,6 +305,8 @@ public:
 		bool shared = !bind_.reuse_port && reactors_.size() > 1;
 		// Register controls and guards before launching any thread, including immediate stop.
 		for (auto& r : reactors_) { guards_.emplace_back(asio::make_work_guard(r->io())); }
+		// Every possible session destination must be running before admission.
+		for (auto& r : reactors_) { Reactor* rp = r.get(); threads_.emplace_back([rp] { rp->io().run(); }); }
 		if (shared) {
 			std::vector<Reactor*> raw;
 			for (auto& r : reactors_) { raw.push_back(r.get()); }
@@ -271,11 +322,10 @@ public:
 					[control](std::exception_ptr) { control->finish(); }); } catch (...) { control->finish(); throw; }
 			}
 		}
-		for (auto& r : reactors_) { Reactor* rp = r.get(); threads_.emplace_back([rp] { rp->io().run(); }); }
 		} catch (...) {
 			for (auto& control : accepts_) { control->stopping.store(true); }
-			// No loop thread owns these contexts yet. Finish canceled startup work
-			// here if thread creation or coroutine initiation failed partway through.
+			// Unstarted contexts cannot have admitted sessions. Drain any queued
+			// startup work before retiring the contexts whose threads did launch.
 			for (std::size_t i = threads_.size(); i < reactors_.size(); ++i) { reactors_[i]->io().poll(); }
 			stop();
 			throw;
@@ -293,6 +343,7 @@ public:
 		// Cancel submission is not completion. Reap every accept while all peer
 		// socket services remain alive, then preserve the existing shutdown tail.
 		for (auto& control : accepts_) { control->wait(); }
+		for (auto& r : reactors_) { r->wait_sessions(); }
 		guards_.clear();
 		for (auto& r : reactors_) { r->io().stop(); }
 		for (auto& t : threads_) { if (t.joinable()) { t.join(); } }

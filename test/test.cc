@@ -21,6 +21,16 @@
 #include <future>
 
 static int g_fail = 0;
+struct RetirementCounts { std::atomic<unsigned> started{0}, retired{0}, canceled{0}; };
+static asio::awaitable<void> idle_session(asio::ip::tcp::socket socket,
+	std::shared_ptr<RetirementCounts> counts) {
+	++counts->started;
+	char byte = 0; asio::error_code error;
+	co_await socket.async_read_some(asio::buffer(&byte, 1),
+		asio::redirect_error(asio::use_awaitable, error));
+	if (error == asio::error::operation_aborted) { ++counts->canceled; }
+	++counts->retired;
+}
 static void check(bool ok, const std::string& m) {
 	std::printf("  %s %s\n", ok ? "ok:  " : "FAIL:", m.c_str());
 	if (!ok) { ++g_fail; }
@@ -234,6 +244,23 @@ int main() {
 		service.stop(); ::close(fd);
 	}
 
+	for (auto reactors : {1u, 4u}) {
+		auto counts = std::make_shared<RetirementCounts>();
+		reactor::TcpServer service(reactors, 0, 0,
+			[counts](asio::ip::tcp::socket socket, reactor::Reactor&) {
+				return idle_session(std::move(socket), counts);
+			});
+		auto port = free_port(); service.start(port); wait_listen(port);
+		std::vector<int> clients;
+		for (unsigned i = 0; i != 16; ++i) { clients.push_back(connect_port(port)); }
+		for (unsigned i = 0; i != 200 && counts->started.load() < 16; ++i) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(5));
+		}
+		service.stop();
+		check(counts->started >= 16 && counts->retired == counts->started && counts->canceled >= 15,
+			"stop reaps original idle reads and session callbacks before returning");
+		for (auto fd : clients) { if (fd >= 0) ::close(fd); }
+	}
 	std::printf("\n%s (%d failures)\n", g_fail == 0 ? "PASS" : "FAIL", g_fail);
 	return g_fail == 0 ? 0 : 1;
 }

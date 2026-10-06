@@ -105,3 +105,7 @@ request throughput + latency (~55k req/s at 4 reactors on a laptop).
 ## TCP shutdown ownership
 
 `stop()` runs on an external lifecycle thread. It aborts tracked waits, closes each acceptor on its owning executor and waits for accept-loop completion before stopping any reactor. A shared accept can own a socket backed by another reactor, so cancellation submission alone cannot authorize runtime retirement. Immediate stop, bind failure and repeated stop use the same barrier. Registering a wait after shutdown begins aborts it immediately; abort callbacks run outside the registry mutex. TCP server instances are single-use.
+
+### Original session completion at shutdown
+
+TCP shutdown latches cancellation for each counted session, retires the accept loops, and waits for original session completion while reactor loops and worker pools remain alive. Admission begins after every destination reactor thread has launched. Protocol cleanup must reap its child operations before returning; the runtime barrier counts that return. Call `stop()` from an external thread, since waiting from a reactor or its pool would block the work being retired. Existing constructor and Session APIs remain unchanged.
