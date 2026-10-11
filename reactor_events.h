@@ -68,13 +68,13 @@ public:
 		auto st = state_;
 		asio::post(ex_, [st] {
 			double r = st->repeat_seconds.load(std::memory_order_relaxed);
-			if (r > 0.0) { st->arm(r); } else { st->timer.cancel(); }
+			if (r > 0.0) { st->arm(r); } else { st->cancel(); }
 		});
 	}
 
 	void stop() {
 		auto st = state_;
-		asio::post(ex_, [st] { st->timer.cancel(); });
+		asio::post(ex_, [st] { st->cancel(); });
 	}
 
 private:
@@ -82,6 +82,7 @@ private:
 		asio::steady_timer timer;
 		std::function<void()> cb;
 		std::atomic<double> repeat_seconds{0.0};
+		std::uint64_t generation = 0;
 		explicit State(const asio::any_io_executor& ex) : timer(ex) {}
 
 		static std::chrono::nanoseconds to_ns(double seconds) {
@@ -89,15 +90,21 @@ private:
 				std::chrono::duration<double>(seconds));
 		}
 
+		void cancel() {
+			++generation;
+			timer.cancel();
+		}
+
 		// (Re)arm the timer to fire after `seconds`; re-arms itself for repeat on fire.
 		void arm(double seconds) {
+			const auto admitted = ++generation;
 			timer.expires_after(to_ns(seconds));
 			auto self = shared_from_this();
-			timer.async_wait([self](const asio::error_code& ec) {
-				if (ec) { return; }   // cancelled / re-armed
+			timer.async_wait([self, admitted](const asio::error_code& ec) {
+				if (ec || admitted != self->generation) { return; }   // cancelled / re-armed
 				if (self->cb) { self->cb(); }
 				double r = self->repeat_seconds.load(std::memory_order_relaxed);
-				if (r > 0.0) { self->arm(r); }
+				if (r > 0.0 && admitted == self->generation) { self->arm(r); }
 			});
 		}
 	};
