@@ -50,6 +50,11 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	add_executable(reactor_echo_bench benchmarks/echo_bench.cc)
 	target_link_libraries(reactor_echo_bench PRIVATE reactor)
 
+	add_executable(reactor_accept_pressure_test test/accept_pressure_test.cc)
+	target_link_libraries(reactor_accept_pressure_test PRIVATE reactor)
+	add_test(NAME reactor_accept_pressure COMMAND reactor_accept_pressure_test)
+	set_tests_properties(reactor_accept_pressure PROPERTIES TIMEOUT 15)
+
 	add_executable(reactor_test test/test.cc)
 	target_link_libraries(reactor_test PRIVATE reactor)
 	add_test(NAME reactor COMMAND reactor_test)

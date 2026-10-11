@@ -37,6 +37,7 @@
 
 #pragma once
 
+#include <cerrno>
 #include <asio.hpp>
 #include "connection_admission.h"
 #include <chrono>
@@ -207,10 +208,28 @@ inline void launch_session(Reactor& reactor, const TimedSession& session, asio::
 }
 
 // Accept-loop completion is the retirement barrier for cross-reactor peer sockets.
+inline bool retryable_accept_error(const asio::error_code& error) noexcept {
+	return error == asio::error::no_descriptors || error.value() == ENFILE ||
+		error == asio::error::no_buffer_space || error == asio::error::no_memory ||
+		error == asio::error::connection_aborted || error == asio::error::interrupted ||
+		error == asio::error::try_again || error == asio::error::would_block;
+}
+
 struct AcceptControl {
-	explicit AcceptControl(asio::io_context& io) : executor(io.get_executor()), acceptor(std::make_unique<asio::ip::tcp::acceptor>(io)) {}
+	explicit AcceptControl(asio::io_context& io) : executor(io.get_executor()), acceptor(std::make_unique<asio::ip::tcp::acceptor>(io)), retry_timer(io) {}
 	asio::io_context::executor_type executor;
 	std::unique_ptr<asio::ip::tcp::acceptor> acceptor;
+	asio::steady_timer retry_timer;
+	std::chrono::milliseconds retry_delay{10};
+	asio::awaitable<bool> retry(const asio::error_code& error) {
+		if (stopping.load()) { co_return false; }
+		if (!retryable_accept_error(error)) { throw asio::system_error(error); }
+		retry_timer.expires_after(retry_delay);
+		retry_delay = std::min(retry_delay * 2, std::chrono::milliseconds(1000));
+		asio::error_code timer_error;
+		co_await retry_timer.async_wait(asio::redirect_error(asio::use_awaitable, timer_error));
+		co_return !timer_error && !stopping.load();
+	}
 	std::atomic<bool> stopping{false};
 	std::mutex mutex;
 	std::condition_variable changed;
@@ -256,12 +275,18 @@ inline asio::awaitable<void> accept_loop(Reactor* reactor, const TimedSession* s
 	acceptor.listen(bind.backlog);
 	control->listening();
 	while (!control->stopping.load()) {
-		tcp::socket socket = co_await acceptor.async_accept(asio::use_awaitable);
+		asio::error_code error;
+		tcp::socket socket = co_await acceptor.async_accept(asio::redirect_error(asio::use_awaitable, error));
+		if (error) { if (co_await control->retry(error)) { continue; } co_return; }
+		control->retry_delay = std::chrono::milliseconds(10);
 		if (control->stopping.load()) { co_return; }
 		auto context = SessionContext{std::chrono::steady_clock::now()};
 		std::optional<ConnectionAdmission::Lease> lease;
 		if (admission) { lease = admission->try_enter(); if (!lease) { continue; } }
-		launch_session(*reactor, *session, std::move(socket), context, lease ? std::move(*lease) : ConnectionAdmission::Lease{});
+		bool pressure = false;
+		try { launch_session(*reactor, *session, std::move(socket), context, lease ? std::move(*lease) : ConnectionAdmission::Lease{}); }
+		catch (const std::bad_alloc&) { pressure = true; }
+		if (pressure && !(co_await control->retry(asio::error::no_memory))) { co_return; }
 	}
 }
 
@@ -289,12 +314,18 @@ inline asio::awaitable<void> shared_accept_loop(std::vector<Reactor*> reactors, 
 	while (!control->stopping.load()) {
 		Reactor* r = reactors[next];
 		next = (next + 1 == reactors.size()) ? 0 : next + 1;
-		tcp::socket socket = co_await acceptor.async_accept(r->io(), asio::use_awaitable);
+		asio::error_code error;
+		tcp::socket socket = co_await acceptor.async_accept(r->io(), asio::redirect_error(asio::use_awaitable, error));
+		if (error) { if (co_await control->retry(error)) { continue; } co_return; }
+		control->retry_delay = std::chrono::milliseconds(10);
 		if (control->stopping.load()) { co_return; }
 		auto context = SessionContext{std::chrono::steady_clock::now()};
 		std::optional<ConnectionAdmission::Lease> lease;
 		if (admission) { lease = admission->try_enter(); if (!lease) { continue; } }
-		launch_session(*r, *session, std::move(socket), context, lease ? std::move(*lease) : ConnectionAdmission::Lease{});
+		bool pressure = false;
+		try { launch_session(*r, *session, std::move(socket), context, lease ? std::move(*lease) : ConnectionAdmission::Lease{}); }
+		catch (const std::bad_alloc&) { pressure = true; }
+		if (pressure && !(co_await control->retry(asio::error::no_memory))) { co_return; }
 	}
 }
 
@@ -346,7 +377,11 @@ public:
 		try {
 		bool shared = !bind_.reuse_port && reactors_.size() > 1;
 		// Register controls and guards before launching any thread, including immediate stop.
-		for (auto& r : reactors_) { guards_.emplace_back(asio::make_work_guard(r->io())); }
+		for (auto& r : reactors_) {
+			// Admit every destination's socket service before accepting peers.
+			asio::ip::tcp::socket prepared(r->io());
+			guards_.emplace_back(asio::make_work_guard(r->io()));
+		}
 		// Every possible session destination must be running before admission.
 		for (auto& r : reactors_) { Reactor* rp = r.get(); threads_.emplace_back([rp] { rp->io().run(); }); }
 		if (shared) {
@@ -381,6 +416,7 @@ public:
 			control->stopping.store(true);
 			asio::post(control->executor, [control] {
 				if (control->acceptor) { asio::error_code error; control->acceptor->close(error); }
+				control->retry_timer.cancel();
 			});
 		}
 		// Cancel submission is not completion. Reap every accept while all peer
