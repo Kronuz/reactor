@@ -94,7 +94,7 @@ void qualify_retry_cancel() {
 	asio::steady_timer stop(io, std::chrono::milliseconds(10));
 	stop.async_wait([control](const asio::error_code &) {
 		control->stopping.store(true);
-		control->retry_timer.cancel();
+		control->stop_on_owner();
 	});
 	io.run();
 	check(!retry.get());

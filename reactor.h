@@ -230,6 +230,10 @@ struct AcceptControl {
 		co_await retry_timer.async_wait(asio::redirect_error(asio::use_awaitable, timer_error));
 		co_return !timer_error && !stopping.load();
 	}
+	void stop_on_owner() {
+		if (acceptor) { asio::error_code error; acceptor->close(error); }
+		retry_timer.cancel();
+	}
 	std::atomic<bool> stopping{false};
 	std::mutex mutex;
 	std::condition_variable changed;
@@ -414,10 +418,7 @@ public:
 		for (auto& r : reactors_) { r->abort_all(); }   // unblock any worker stuck mid-request
 		for (auto& control : accepts_) {
 			control->stopping.store(true);
-			asio::post(control->executor, [control] {
-				if (control->acceptor) { asio::error_code error; control->acceptor->close(error); }
-				control->retry_timer.cancel();
-			});
+			asio::post(control->executor, [control] { control->stop_on_owner(); });
 		}
 		// Cancel submission is not completion. Reap every accept while all peer
 		// socket services remain alive, then preserve the existing shutdown tail.
