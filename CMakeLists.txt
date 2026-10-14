@@ -38,6 +38,14 @@ target_compile_definitions(reactor INTERFACE ASIO_STANDALONE)
 target_link_libraries(reactor INTERFACE Threads::Threads)
 add_library(reactor::reactor ALIAS reactor)
 
+# --- TLS configuration (reactor_tls.h), when OpenSSL 3 is available ---
+find_package(OpenSSL 3.0 QUIET)
+if(OpenSSL_FOUND)
+	add_library(reactor_tls INTERFACE)
+	target_link_libraries(reactor_tls INTERFACE reactor OpenSSL::SSL OpenSSL::Crypto)
+	add_library(reactor::tls ALIAS reactor_tls)
+endif()
+
 # --- example + benchmark + tests (built only when this repo is top-level) ---
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	enable_testing()
@@ -54,6 +62,12 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	target_link_libraries(reactor_accept_pressure_test PRIVATE reactor)
 	add_test(NAME reactor_accept_pressure COMMAND reactor_accept_pressure_test)
 	set_tests_properties(reactor_accept_pressure PROPERTIES TIMEOUT 15)
+
+	if(TARGET reactor::tls)
+		add_executable(reactor_tls_test test/tls_test.cc)
+		target_link_libraries(reactor_tls_test PRIVATE reactor::tls)
+		add_test(NAME reactor_tls COMMAND reactor_tls_test)
+	endif()
 
 	add_executable(reactor_test test/test.cc)
 	target_link_libraries(reactor_test PRIVATE reactor)
