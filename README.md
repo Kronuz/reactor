@@ -1,5 +1,7 @@
 # reactor
 
+[![CI](https://github.com/Kronuz/reactor/actions/workflows/ci.yml/badge.svg)](https://github.com/Kronuz/reactor/actions/workflows/ci.yml)
+
 A generic Asio **server runtime**: the shared-nothing, thread-per-core reactor pool
 plus accept plumbing plus graceful shutdown that every network protocol needs, with
 the protocol itself left entirely to you. On
