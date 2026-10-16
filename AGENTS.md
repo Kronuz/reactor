@@ -9,7 +9,7 @@ shared-nothing reactor pool + accept plumbing + graceful shutdown that every net
 protocol needs, with the protocol left entirely to the caller. For TCP you provide a
 `Session` coroutine that serves one connection; for connectionless UDP you provide a
 `Datagram` handler called per packet. The runtime owns the loops, the threads, the
-acceptor/socket, the offload pool, and the shutdown. Header-only. Read `README.md` for
+acceptor/socket, the offload pool, and the shutdown. Header-only. Read `README.md` and `docs/API.md` for
 the shape, `ARCHITECTURE.md` for how a connection flows; this is the working notes.
 
 ## File map
