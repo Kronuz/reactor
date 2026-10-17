@@ -36,10 +36,13 @@ namespace reactor::tls {
 
 // PEM files: this end's certificate chain and key, and the authority that signs peers.
 // `system_roots` also trusts the system's root certificates, for clients of servers with
-// public certificates; peers always need their own authority.
+// public certificates; peers always need their own authority. `strict` keeps TLS 1.2 to
+// forward-secret AEAD suites (ECDHE with AES-GCM or ChaCha20-Poly1305) and turns session
+// resumption off in both versions: no tickets, no session-ID cache.
 struct Options {
 	std::string certificate, private_key, certificate_authority;
 	bool system_roots = false;
+	bool strict = false;
 };
 
 // Peer: mutual TLS, both ends present certificates. Server: presents one and does not
@@ -64,6 +67,12 @@ inline void configure(asio::ssl::context& context, const Options& options, Role 
 	SSL_CTX_set_max_early_data(context.native_handle(), 0);
 	SSL_CTX_set_options(context.native_handle(), SSL_OP_NO_RENEGOTIATION);
 	SSL_CTX_set_max_cert_list(context.native_handle(), 64 * 1024);
+	if (options.strict) {
+		if (SSL_CTX_set_cipher_list(context.native_handle(), "ECDHE+AESGCM:ECDHE+CHACHA20:!aNULL") != 1) { throw std::runtime_error("TLS cipher list"); }
+		SSL_CTX_set_options(context.native_handle(), SSL_OP_NO_TICKET);
+		SSL_CTX_set_num_tickets(context.native_handle(), 0);  // with NO_TICKET alone, TLS 1.3 tickets turn stateful
+		SSL_CTX_set_session_cache_mode(context.native_handle(), SSL_SESS_CACHE_OFF);
+	}
 	if (!options.certificate.empty()) {
 		context.use_certificate_chain_file(options.certificate);
 		context.use_private_key_file(options.private_key, asio::ssl::context::pem);

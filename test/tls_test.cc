@@ -39,8 +39,8 @@ static int failures = 0;
 	} while (0)
 
 // A self-signed certificate for localhost, and its key, written as PEM files.
-static void self_signed(const std::string& cert_path, const std::string& key_path) {
-	EVP_PKEY* key = EVP_EC_gen("P-256");
+static void self_signed(const std::string& cert_path, const std::string& key_path, bool rsa = false) {
+	EVP_PKEY* key = rsa ? EVP_RSA_gen(2048) : EVP_EC_gen("P-256");
 	X509* x = X509_new();
 	X509_set_version(x, 2);
 	ASN1_INTEGER_set(X509_get_serialNumber(x), 1);
@@ -75,9 +75,13 @@ static void self_signed(const std::string& cert_path, const std::string& key_pat
 
 // Runs a TLS handshake between two contexts over a memory BIO pair; the client verifies
 // "localhost". Returns the client's verification result, or -1 when the handshake fails.
-static long handshake(asio::ssl::context& server, asio::ssl::context& client) {
+static long handshake(asio::ssl::context& server, asio::ssl::context& client, const char* tls12_cipher = nullptr) {
 	SSL* s = SSL_new(server.native_handle());
 	SSL* c = SSL_new(client.native_handle());
+	if (tls12_cipher) {  // the client offers TLS 1.2 with this one suite only
+		SSL_set_max_proto_version(c, TLS1_2_VERSION);
+		SSL_set_cipher_list(c, tls12_cipher);
+	}
 	reactor::tls::bind_hostname(c, "localhost");
 	BIO *sb = nullptr, *cb = nullptr;
 	BIO_new_bio_pair(&sb, 0, &cb, 0);
@@ -138,6 +142,27 @@ int main() {
 		reactor::tls::configure(roots, Options{"", "", "", true}, Role::Client);
 		CHECK(handshake(server, trusting) == X509_V_OK);
 		CHECK(handshake(server, roots) == -1);  // a self-signed certificate is in no system's roots
+	}
+	// strict: TLS 1.2 keeps only forward-secret AEAD suites; without it, OpenSSL's defaults.
+	{
+		const std::string rsa_cert = std::string(dir) + "/rsa.pem", rsa_key = std::string(dir) + "/rsa.key";
+		self_signed(rsa_cert, rsa_key, true);
+		asio::ssl::context strict(asio::ssl::context::tls), lax(asio::ssl::context::tls), client(asio::ssl::context::tls);
+		reactor::tls::Options so{rsa_cert, rsa_key, ""};
+		so.strict = true;
+		reactor::tls::configure(strict, so, Role::Server);
+		reactor::tls::configure(lax, Options{rsa_cert, rsa_key, ""}, Role::Server);
+		reactor::tls::configure(client, Options{"", "", rsa_cert}, Role::Client);
+		CHECK(handshake(strict, client, "ECDHE-RSA-AES128-GCM-SHA256") == X509_V_OK);  // ECDHE-AEAD accepted
+		CHECK(handshake(strict, client, "AES128-GCM-SHA256") == -1);                    // static RSA refused
+		CHECK(handshake(strict, client, "ECDHE-RSA-AES128-SHA") == -1);                 // CBC refused
+		CHECK(handshake(lax, client, "AES128-GCM-SHA256") == X509_V_OK);                // unchanged without strict
+		CHECK((SSL_CTX_get_options(strict.native_handle()) & SSL_OP_NO_TICKET) != 0);
+		CHECK(SSL_CTX_get_num_tickets(strict.native_handle()) == 0);
+		CHECK(SSL_CTX_get_session_cache_mode(strict.native_handle()) == SSL_SESS_CACHE_OFF);
+		CHECK((SSL_CTX_get_options(lax.native_handle()) & SSL_OP_NO_TICKET) == 0);
+		std::remove(rsa_cert.c_str());
+		std::remove(rsa_key.c_str());
 	}
 	std::remove(cert.c_str());
 	std::remove(key.c_str());
