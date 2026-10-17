@@ -26,7 +26,9 @@ reinvent their plumbing.
   pressure.
 - **UDP too**: `UdpServer` with multicast, for gossip and discovery.
 - **Optional TLS** (`reactor::tls`), used by [http](https://github.com/Kronuz/http)
-  and [consensus](https://github.com/Kronuz/consensus)'s transport.
+  and [consensus](https://github.com/Kronuz/consensus)'s transport: mutual TLS between
+  peers, servers with just a certificate and key, and clients that trust a private
+  authority or the system's roots.
 
 ## 📦 Installation
 

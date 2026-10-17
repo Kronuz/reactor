@@ -35,12 +35,16 @@
 namespace reactor::tls {
 
 // PEM files: this end's certificate chain and key, and the authority that signs peers.
+// `system_roots` also trusts the system's root certificates, for clients of servers with
+// public certificates; peers always need their own authority.
 struct Options {
 	std::string certificate, private_key, certificate_authority;
+	bool system_roots = false;
 };
 
 // Peer: mutual TLS, both ends present certificates. Server: presents one and does not
-// ask the client for one. Client: verifies the server and may present one.
+// ask the client for one, so it needs no authority. Client: verifies the server and may
+// present one.
 enum class Role { Peer, Server, Client };
 
 // TLS 1.2 or later, no renegotiation, no 0-RTT data, a 64 KiB certificate-list cap.
@@ -48,8 +52,10 @@ enum class Role { Peer, Server, Client };
 // does not match the certificate.
 inline void configure(asio::ssl::context& context, const Options& options, Role role) {
 	const bool certificate_required = role != Role::Client;
-	if (options.certificate_authority.empty() || (certificate_required && (options.certificate.empty() || options.private_key.empty())) ||
-		(options.certificate.empty() != options.private_key.empty())) {
+	const bool system_roots = options.system_roots && role != Role::Peer;
+	const bool authority = !options.certificate_authority.empty() || system_roots;
+	if ((role != Role::Server && !authority) || (certificate_required && (options.certificate.empty() || options.private_key.empty())) ||
+		(options.certificate.empty() != options.private_key.empty()) || (options.system_roots && role == Role::Peer)) {
 		throw std::invalid_argument("incomplete TLS configuration");
 	}
 	context.set_options(asio::ssl::context::default_workarounds | asio::ssl::context::no_sslv2 | asio::ssl::context::no_sslv3 |
@@ -63,7 +69,8 @@ inline void configure(asio::ssl::context& context, const Options& options, Role 
 		context.use_private_key_file(options.private_key, asio::ssl::context::pem);
 		if (SSL_CTX_check_private_key(context.native_handle()) != 1) { throw std::invalid_argument("TLS key mismatch"); }
 	}
-	context.load_verify_file(options.certificate_authority);
+	if (!options.certificate_authority.empty()) { context.load_verify_file(options.certificate_authority); }
+	if (system_roots) { context.set_default_verify_paths(); }
 	context.set_verify_mode(role == Role::Peer ? asio::ssl::verify_peer | asio::ssl::verify_fail_if_no_peer_cert
 		: role == Role::Client                 ? asio::ssl::verify_peer
 											   : asio::ssl::verify_none);
