@@ -97,7 +97,9 @@ benchmarks/echo_bench.cc  The reactor pool's request throughput + latency: an ec
   should post sends too.
 - **UDP: a throwing Datagram handler never ends the receive loop.** The loop catches
   per datagram, reports through `L_EXC` (`reactor_trace.h`), and keeps receiving; one bad
-  message must not deafen a gossip node. Only receive errors (shutdown) end it.
+  message must not deafen a gossip node. A receive error (the socket closed or cancelled
+  under the running loop, or a failed receive) ends it, silently. `stop()` does not pass
+  through it: it stops the io_context, and the suspended loop is destroyed with it.
 - **UDP multicast interface selection is load-bearing on multi-homed hosts.** INADDR_ANY
   (the default) uses the default-route interface, which a VPN/utun often can't multicast
   on; pin `multicast_interface` (e.g. `127.0.0.1`) to keep one-host gossip self-contained.

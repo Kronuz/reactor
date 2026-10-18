@@ -24,7 +24,8 @@ reinvent their plumbing.
   for sessions to return, then joins.
 - **Connection limits** with exact accounting, and accept retry under descriptor
   pressure.
-- **UDP too**: `UdpServer` with multicast, for gossip and discovery.
+- **UDP too**: `UdpServer` with multicast, for gossip and discovery. A handler that
+  throws costs one datagram, not the receive loop.
 - **Optional TLS** (`reactor::tls`), used by [http](https://github.com/Kronuz/http)
   and [consensus](https://github.com/Kronuz/consensus)'s transport: mutual TLS between
   peers, servers with just a certificate and key, clients that trust a private

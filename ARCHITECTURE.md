@@ -35,7 +35,7 @@ not depended on here (see [What lives above](#what-lives-above-not-here)).
 
 ## One layer, one job
 
-The library is two headers — `reactor.h` (TCP) and `reactor_udp.h` (UDP) — drawing one
+The library's two transports — `reactor.h` (TCP) and `reactor_udp.h` (UDP) — draw one
 seam: the **runtime** below, the **protocol** above. Everything here is transport
 mechanics — loops, threads, acceptors/sockets, offload, shutdown. Nothing here knows a
 wire format.

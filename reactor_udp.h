@@ -209,7 +209,8 @@ private:
 				}
 			}
 		} catch (const std::exception&) {
-			// socket closed at shutdown (operation_aborted) or a fatal receive error.
+			// socket closed or cancelled under the running loop, or a failed receive. stop()
+			// never lands here: the stopped io_context destroys the suspended loop.
 		}
 	}
 
