@@ -21,8 +21,8 @@ reactor_udp.h        The connectionless transport. reactor::{UdpOptions, Datagra
                      -- one reactor + one bound UDP socket + a receive loop, with the full
                      multicast toolkit (reuse_port, IP_MULTICAST_LOOP/TTL, join a group,
                      SND/RCV buffers). Includes reactor.h (reuses Reactor).
-reactor_trace.h      The logging seam: a no-op L_EXC unless the consumer defines one or
-                     points REACTOR_TRACE_HEADER at its own header.
+reactor_trace.h      The logging seam and its contract: a no-op L_EXC unless the consumer
+                     points REACTOR_TRACE_HEADER at its own header (target-wide).
 reactor_events.h     Loop primitives: reactor::PeriodicTimer (ev::timer replacement --
                      start/again/stop/repeat over steady_timer) + reactor::Signal (ev::async
                      replacement -- send() posts to the loop, coalescing). For lifting a

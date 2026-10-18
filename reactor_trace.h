@@ -20,25 +20,22 @@
  * THE SOFTWARE.
  */
 
-/*
- * Default (no-op) logging hook for the header-only `reactor` library.
- *
- *   - L_EXC(...)  logs an exception the runtime swallows to keep a loop alive
- *                 (today: a UdpServer Datagram handler that threw). Called from
- *                 inside the catch block, so the hook can inspect the in-flight
- *                 exception. No-op by default.
- *
- * To plug in real logging (as Xapiand does for its other libraries), either:
- *
- *   1. Define REACTOR_TRACE_HEADER to the path of a header that defines it,
- *        c++ -DREACTOR_TRACE_HEADER='"my_trace.h"' ...
- *      and the reactor headers include that instead of this file, or
- *
- *   2. Define the macro before including the reactor headers.
- *
- * The macro is `#ifndef`-guarded, so an L_EXC already defined by the consumer
- * (or by a sibling Kronuz library's trace header) wins.
- */
+// The reactor's logging seam: L_EXC reports an exception the runtime swallows to keep a
+// loop alive (today: a UdpServer Datagram handler that threw). No-op by default.
+//
+// Contract for a consumer's L_EXC:
+//   1. It takes one string literal and no other arguments, so fmt- and printf-style
+//      hooks both fit.
+//   2. It runs inside the catch block, with the exception in flight
+//      (std::current_exception()).
+//   3. It must not throw; the loop drops anything it throws.
+//   4. A captured exception may view the datagram's bytes, which the next receive
+//      overwrites; an asynchronous logger must not read such views later.
+//   5. Every translation unit must see the same definition (receive_loop is inline, so
+//      differing ones violate the ODR). Set REACTOR_TRACE_HEADER target-wide, e.g.
+//        -DREACTOR_TRACE_HEADER='"my_trace.h"'
+//      reactor_udp.h includes that header, then this one, which fills in whatever it
+//      leaves undefined.
 
 #pragma once
 

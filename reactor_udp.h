@@ -40,13 +40,12 @@
 
 #include "reactor.h"
 
-// Logging is injectable: REACTOR_TRACE_HEADER names a header defining L_EXC;
-// otherwise reactor_trace.h's no-op stub is used.
+// Logging is injectable: REACTOR_TRACE_HEADER names a header defining L_EXC, and
+// reactor_trace.h's no-op stub fills in whatever it leaves undefined.
 #ifdef REACTOR_TRACE_HEADER
 #  include REACTOR_TRACE_HEADER
-#else
-#  include "reactor_trace.h"
 #endif
+#include "reactor_trace.h"
 
 #include <asio.hpp>
 
@@ -78,8 +77,9 @@ struct UdpOptions {
 };
 
 // Invoked for each received datagram: the bytes and the sender. Runs on the UDP reactor
-// thread (the same loop the app's timers run on), so it never races them. An exception
-// it throws is reported through L_EXC and dropped; the receive loop keeps going.
+// thread (the same loop the app's timers run on), so it never races them. The bytes are
+// valid only during the call; the next receive reuses the buffer. An exception it throws
+// is reported through L_EXC and dropped; the receive loop keeps going.
 using Datagram = std::function<void(std::string_view, const asio::ip::udp::endpoint&)>;
 
 class UdpServer {

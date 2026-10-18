@@ -26,8 +26,9 @@ group, large SND/RCV buffers). No per-connection Session — UDP is connectionle
 the framing is still entirely yours. Its `io()` is exposed so a single-threaded protocol
 runs its own timers on the same loop as the receive (no locking between them).
 A handler that throws loses only that datagram: the loop reports it through `L_EXC`
-(define it, or point `REACTOR_TRACE_HEADER` at your logging header; see
-`reactor_trace.h`) and keeps receiving.
+and keeps receiving. Point `REACTOR_TRACE_HEADER` at your logging header target-wide;
+`reactor_trace.h` states the hook's contract (one string literal, must not throw, the
+same definition in every translation unit).
 
 ```cpp
 #include "reactor_udp.h"
