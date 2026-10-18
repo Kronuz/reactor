@@ -2,7 +2,8 @@
 // reaches the handler, a multicast datagram loops back to the sender AND reaches a second
 // node sharing the port (the exact shape a one-host gossip cluster uses), an app timer
 // runs on the same loop as the receive (the executor-sharing a single-threaded protocol
-// needs), and stop() returns while a receive is pending.
+// needs), stop() returns while a receive is pending, and a throwing handler neither
+// ends the receive loop nor goes unreported.
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -16,7 +17,12 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <stdexcept>
 #include <thread>
+
+// Count what the library reports through its L_EXC seam.
+static std::atomic<int> g_exc{0};
+#define L_EXC(...) g_exc.fetch_add(1)
 
 #include "reactor_udp.h"
 
@@ -162,6 +168,31 @@ int main() {
 		for (int i = 0; i < 500 && !stopped.load(); ++i) { std::this_thread::sleep_for(10ms); }
 		check(stopped.load(), "stop() returns with a receive pending (no hang)");
 		if (stopped.load()) { t.join(); delete srv; } else { t.detach(); }
+	}
+
+	// [E] a handler that throws (a std::exception, then anything else) does not end the
+	// receive loop: the next datagram still arrives, and each throw reaches L_EXC.
+	{
+		unsigned short port = free_udp_port();
+		std::atomic<int> calls{0}, delivered{0};
+		reactor::UdpServer srv([&](std::string_view d, const asio::ip::udp::endpoint&) {
+			calls.fetch_add(1);
+			if (d == "throw-std") { throw std::runtime_error("handler failure"); }
+			if (d == "throw-other") { throw 7; }
+			delivered.fetch_add(1);
+		});
+		reactor::UdpOptions o; o.address = "127.0.0.1"; srv.set_options(o);
+		srv.start(port);
+		std::this_thread::sleep_for(30ms);
+		send_unicast(port, "throw-std");
+		for (int i = 0; i < 400 && calls.load() < 1; ++i) { std::this_thread::sleep_for(5ms); }
+		send_unicast(port, "throw-other");
+		for (int i = 0; i < 400 && calls.load() < 2; ++i) { std::this_thread::sleep_for(5ms); }
+		send_unicast(port, "after");
+		for (int i = 0; i < 400 && delivered.load() < 1; ++i) { std::this_thread::sleep_for(5ms); }
+		check(calls.load() == 3, "a throwing handler does not end the receive loop");
+		check(delivered.load() == 1, "the datagram after two throws reaches the handler");
+		check(g_exc.load() == 2, "each handler exception is reported through L_EXC");
 	}
 
 	std::printf("\n%s (%d failures)\n", g_fail == 0 ? "PASS" : "FAIL", g_fail);
