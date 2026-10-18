@@ -204,7 +204,8 @@ private:
 					try {
 						on_datagram_(std::string_view(buf.data(), n), from);
 					} catch (...) {
-						L_EXC("ERROR: UDP datagram handler died with an unhandled exception");
+						// A throwing hook must not end the loop either.
+						try { L_EXC("ERROR: UDP datagram handler died with an unhandled exception"); } catch (...) {}
 					}
 				}
 			}
