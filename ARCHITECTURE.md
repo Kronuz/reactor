@@ -170,7 +170,8 @@ so a connection that finished normally leaves nothing behind. The destructor cal
         if multicast:  enable_loopback, ttl, outbound_interface (IP_MULTICAST_IF)
         bind(port)                 -- THROWS on failure (the app decides what that means)
         if multicast:  join_group(group[, interface])   -- and remember group:port for send()
-        co_spawn(receive_loop)     -- async_receive_from -> on_datagram(bytes, from), forever
+        co_spawn(receive_loop)     -- async_receive_from -> on_datagram(bytes, from), forever;
+                                      a handler throw goes to L_EXC and the loop continues
         run() on the thread
       send(data)      -> send_to(data, group:port)
       send_to(d, ep)  -> one datagram to ep

@@ -40,6 +40,14 @@
 
 #include "reactor.h"
 
+// Logging is injectable: REACTOR_TRACE_HEADER names a header defining L_EXC;
+// otherwise reactor_trace.h's no-op stub is used.
+#ifdef REACTOR_TRACE_HEADER
+#  include REACTOR_TRACE_HEADER
+#else
+#  include "reactor_trace.h"
+#endif
+
 #include <asio.hpp>
 
 #include <cstddef>
@@ -70,7 +78,8 @@ struct UdpOptions {
 };
 
 // Invoked for each received datagram: the bytes and the sender. Runs on the UDP reactor
-// thread (the same loop the app's timers run on), so it never races them.
+// thread (the same loop the app's timers run on), so it never races them. An exception
+// it throws is reported through L_EXC and dropped; the receive loop keeps going.
 using Datagram = std::function<void(std::string_view, const asio::ip::udp::endpoint&)>;
 
 class UdpServer {
@@ -191,7 +200,12 @@ private:
 				std::size_t n = co_await socket_.async_receive_from(
 					asio::buffer(buf), from, asio::use_awaitable);
 				if (n != 0 && on_datagram_) {
-					on_datagram_(std::string_view(buf.data(), n), from);
+					// One bad datagram must not deafen the node: log the throw, keep receiving.
+					try {
+						on_datagram_(std::string_view(buf.data(), n), from);
+					} catch (...) {
+						L_EXC("ERROR: UDP datagram handler died with an unhandled exception");
+					}
 				}
 			}
 		} catch (const std::exception&) {

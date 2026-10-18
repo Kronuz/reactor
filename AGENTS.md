@@ -21,6 +21,8 @@ reactor_udp.h        The connectionless transport. reactor::{UdpOptions, Datagra
                      -- one reactor + one bound UDP socket + a receive loop, with the full
                      multicast toolkit (reuse_port, IP_MULTICAST_LOOP/TTL, join a group,
                      SND/RCV buffers). Includes reactor.h (reuses Reactor).
+reactor_trace.h      The logging seam: a no-op L_EXC unless the consumer defines one or
+                     points REACTOR_TRACE_HEADER at its own header.
 reactor_events.h     Loop primitives: reactor::PeriodicTimer (ev::timer replacement --
                      start/again/stop/repeat over steady_timer) + reactor::Signal (ev::async
                      replacement -- send() posts to the loop, coalescing). For lifting a
@@ -33,7 +35,8 @@ test/test.cc         ctest "reactor": a line-echo server end-to-end over real TC
                      keeps the reactor free, and a stop() that unblocks an Abortable.
 test/udp_test.cc     ctest "reactor_udp": unicast delivery, multicast loopback between two
                      sockets sharing a port (pinned to loopback, env-probed), an app timer
-                     on the same loop, and stop() with a receive pending.
+                     on the same loop, stop() with a receive pending, and a throwing
+                     handler that neither ends the loop nor goes unreported.
 test/events_test.cc  ctest "reactor_events": PeriodicTimer one-shot/repeat/again/stop +
                      Signal runs-on-the-loop and coalescing.
 examples/echo_server.cc   A runnable TCP echo server -- the smallest reactor::TcpServer
@@ -92,6 +95,9 @@ benchmarks/echo_bench.cc  The reactor pool's request throughput + latency: an ec
   not call them from another thread. `send()`/`send_to()` are the exception (UDP send and
   receive are independent directions, safe concurrently), but a strict-ordering protocol
   should post sends too.
+- **UDP: a throwing Datagram handler never ends the receive loop.** The loop catches
+  per datagram, reports through `L_EXC` (`reactor_trace.h`), and keeps receiving; one bad
+  message must not deafen a gossip node. Only receive errors (shutdown) end it.
 - **UDP multicast interface selection is load-bearing on multi-homed hosts.** INADDR_ANY
   (the default) uses the default-route interface, which a VPN/utun often can't multicast
   on; pin `multicast_interface` (e.g. `127.0.0.1`) to keep one-host gossip self-contained.
