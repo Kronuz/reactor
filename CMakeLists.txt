@@ -79,6 +79,17 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	add_test(NAME reactor_udp COMMAND reactor_udp_test)
 	set_tests_properties(reactor_udp PROPERTIES TIMEOUT 60)
 
+	# The logging seam as consumers compile it: the default no-op L_EXC, and a trace header.
+	add_executable(reactor_udp_seam_default_test test/udp_seam_test.cc)
+	target_link_libraries(reactor_udp_seam_default_test PRIVATE reactor)
+	add_test(NAME reactor_udp_seam_default COMMAND reactor_udp_seam_default_test)
+	add_executable(reactor_udp_seam_header_test test/udp_seam_test.cc)
+	target_link_libraries(reactor_udp_seam_header_test PRIVATE reactor)
+	target_compile_definitions(reactor_udp_seam_header_test PRIVATE
+		REACTOR_TRACE_HEADER="${CMAKE_CURRENT_SOURCE_DIR}/test/udp_seam_trace.h")
+	add_test(NAME reactor_udp_seam_header COMMAND reactor_udp_seam_header_test)
+	set_tests_properties(reactor_udp_seam_default reactor_udp_seam_header PROPERTIES TIMEOUT 60)
+
 	add_executable(reactor_events_test test/events_test.cc)
 	target_link_libraries(reactor_events_test PRIVATE reactor)
 	add_test(NAME reactor_events COMMAND reactor_events_test)

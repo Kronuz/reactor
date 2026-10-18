@@ -2,53 +2,35 @@
 // reaches the handler, a multicast datagram loops back to the sender AND reaches a second
 // node sharing the port (the exact shape a one-host gossip cluster uses), an app timer
 // runs on the same loop as the receive (the executor-sharing a single-threaded protocol
-// needs), stop() returns while a receive is pending, and a throwing handler neither
-// ends the receive loop nor goes unreported.
+// needs), stop() returns while a receive is pending, a throwing handler neither ends the
+// receive loop nor goes unreported, and a receive error ends the loop without a report.
 
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <exception>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <stdexcept>
 #include <thread>
 
-// Count what the library reports through its L_EXC seam.
-static std::atomic<int> g_exc{0};
-#define L_EXC(...) g_exc.fetch_add(1)
+// Count what the library reports through its L_EXC seam, and how often an exception was
+// in flight when it did.
+static std::atomic<int> g_exc{0}, g_inflight{0};
+#define L_EXC(...) (g_exc.fetch_add(1), g_inflight.fetch_add(std::current_exception() ? 1 : 0))
 
 #include "reactor_udp.h"
+#include "udp_helpers.h"
 
 using namespace std::chrono_literals;
-
-static int g_fail = 0;
-static void check(bool ok, const std::string& m) {
-	std::printf("  %s %s\n", ok ? "ok:  " : "FAIL:", m.c_str());
-	if (!ok) { ++g_fail; }
-}
-
-static unsigned short free_udp_port() {
-	int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
-	sockaddr_in a{}; a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_LOOPBACK); a.sin_port = 0;
-	::bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a));
-	socklen_t len = sizeof(a); ::getsockname(fd, reinterpret_cast<sockaddr*>(&a), &len);
-	unsigned short p = ntohs(a.sin_port); ::close(fd); return p;
-}
-
-static void send_unicast(unsigned short port, const std::string& msg) {
-	int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
-	sockaddr_in dst{}; dst.sin_family = AF_INET; dst.sin_port = htons(port);
-	::inet_pton(AF_INET, "127.0.0.1", &dst.sin_addr);
-	::sendto(fd, msg.data(), msg.size(), 0, reinterpret_cast<sockaddr*>(&dst), sizeof(dst));
-	::close(fd);
-}
 
 // Probe (with raw sockets, over the loopback interface) whether this host can multicast
 // loopback at all -- a VPN/utun default route often can't, and there is no point asserting
@@ -193,6 +175,39 @@ int main() {
 		check(calls.load() == 3, "a throwing handler does not end the receive loop");
 		check(delivered.load() == 1, "the datagram after two throws reaches the handler");
 		check(g_exc.load() == 2, "each handler exception is reported through L_EXC");
+		check(g_inflight.load() == 2, "L_EXC runs with the handler's exception in flight");
+	}
+
+	// [F] a receive error (the socket closed under the running loop) ends the loop without
+	// a report and without spinning, and stop() still returns.
+	{
+		unsigned short port = free_udp_port();
+		std::atomic<int> calls{0};
+		int reported = g_exc.load();
+		reactor::UdpServer srv([&](std::string_view, const asio::ip::udp::endpoint&) { calls.fetch_add(1); });
+		auto guard = asio::make_work_guard(srv.io());   // keeps run() alive once the loop ends
+		reactor::UdpOptions o; o.address = "127.0.0.1"; srv.set_options(o);
+		srv.start(port);
+		std::this_thread::sleep_for(30ms);
+		asio::post(srv.io(), [&srv] { srv.socket().close(); });
+		std::this_thread::sleep_for(30ms);
+		send_unicast(port, "after");
+		// The loop thread's CPU time over 200 ms: a loop that re-armed a dead socket would spin.
+		auto cpu_ns = [] {
+			timespec ts{}; ::clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+			return static_cast<long long>(ts.tv_sec) * 1000000000LL + ts.tv_nsec;
+		};
+		std::atomic<long long> c0{-1}, c1{-1};
+		asio::post(srv.io(), [&] { c0.store(cpu_ns()); });
+		for (int i = 0; i < 400 && c0.load() < 0; ++i) { std::this_thread::sleep_for(5ms); }
+		std::this_thread::sleep_for(200ms);
+		asio::post(srv.io(), [&] { c1.store(cpu_ns()); });
+		for (int i = 0; i < 400 && c1.load() < 0; ++i) { std::this_thread::sleep_for(5ms); }
+		check(calls.load() == 0, "a closed socket delivers nothing");
+		check(g_exc.load() == reported, "a receive error is not reported as a handler failure");
+		check(c0.load() >= 0 && c1.load() >= 0 && c1.load() - c0.load() < 50000000LL,
+			"the ended loop does not spin (under 50 ms of CPU in 200 ms)");
+		srv.stop();   // a hang here trips ctest's TIMEOUT
 	}
 
 	std::printf("\n%s (%d failures)\n", g_fail == 0 ? "PASS" : "FAIL", g_fail);

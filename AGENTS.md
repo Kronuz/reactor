@@ -35,8 +35,14 @@ test/test.cc         ctest "reactor": a line-echo server end-to-end over real TC
                      keeps the reactor free, and a stop() that unblocks an Abortable.
 test/udp_test.cc     ctest "reactor_udp": unicast delivery, multicast loopback between two
                      sockets sharing a port (pinned to loopback, env-probed), an app timer
-                     on the same loop, stop() with a receive pending, and a throwing
-                     handler that neither ends the loop nor goes unreported.
+                     on the same loop, stop() with a receive pending, a throwing
+                     handler that neither ends the loop nor goes unreported (the
+                     exception in flight in L_EXC), and a receive error that ends the
+                     loop unreported and without spinning.
+test/udp_seam_test.cc  ctest "reactor_udp_seam_default" / "reactor_udp_seam_header": the
+                     logging seam compiled as consumers do, with the no-op L_EXC and with
+                     REACTOR_TRACE_HEADER (test/udp_seam_trace.h). test/udp_helpers.h
+                     holds the UDP tests' shared helpers.
 test/events_test.cc  ctest "reactor_events": PeriodicTimer one-shot/repeat/again/stop +
                      Signal runs-on-the-loop and coalescing.
 examples/echo_server.cc   A runnable TCP echo server -- the smallest reactor::TcpServer
