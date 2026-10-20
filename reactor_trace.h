@@ -21,7 +21,7 @@
  */
 
 // The reactor's logging seam: L_EXC reports an exception the runtime swallows to keep a
-// loop alive (today: a UdpServer Datagram handler that threw). No-op by default.
+// UDP owner loop alive after a datagram, posted or timer callback throws. No-op by default.
 //
 // Contract for a consumer's L_EXC:
 //   1. It takes one string literal and no other arguments, so fmt- and printf-style

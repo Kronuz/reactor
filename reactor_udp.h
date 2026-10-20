@@ -142,7 +142,12 @@ public:
 		}
 
 		asio::co_spawn(reactor_.io(), receive_loop(), asio::detached);
-		thread_ = std::thread([this] { reactor_.io().run(); });
+		thread_ = std::thread([this] {
+			while (!reactor_.io().stopped()) {
+				try { reactor_.io().run(); break; }
+				catch (...) { report_callback_exception(); }
+			}
+		});
 	}
 
 	// Abort in-flight offload work, stop the loop (abandons the pending receive), join,
@@ -192,6 +197,10 @@ private:
 		}
 	}
 
+	static void report_callback_exception() noexcept {
+		try { L_EXC("ERROR: UDP reactor callback died with an unhandled exception"); } catch (...) {}
+	}
+
 	asio::awaitable<void> receive_loop() {
 		std::vector<char> buf(opts_.max_datagram != 0 ? opts_.max_datagram : 1500);
 		asio::ip::udp::endpoint from;
@@ -205,7 +214,7 @@ private:
 						on_datagram_(std::string_view(buf.data(), n), from);
 					} catch (...) {
 						// A throwing hook must not end the loop either.
-						try { L_EXC("ERROR: UDP datagram handler died with an unhandled exception"); } catch (...) {}
+						report_callback_exception();
 					}
 				}
 			}

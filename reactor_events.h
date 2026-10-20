@@ -34,6 +34,7 @@
 #include <asio.hpp>
 
 #include <atomic>
+#include <exception>
 #include <chrono>
 #include <functional>
 #include <memory>
@@ -102,9 +103,12 @@ private:
 			auto self = shared_from_this();
 			timer.async_wait([self, admitted](const asio::error_code& ec) {
 				if (ec || admitted != self->generation) { return; }   // cancelled / re-armed
-				if (self->cb) { self->cb(); }
+				std::exception_ptr failure;
+				try { if (self->cb) { self->cb(); } }
+				catch (...) { failure = std::current_exception(); }
 				double r = self->repeat_seconds.load(std::memory_order_relaxed);
 				if (r > 0.0 && admitted == self->generation) { self->arm(r); }
+				if (failure) { std::rethrow_exception(failure); }
 			});
 		}
 	};

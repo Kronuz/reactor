@@ -105,3 +105,7 @@ point; read [AGENTS.md](AGENTS.md) first. CI must pass on every platform.
 ## 📄 License
 
 MIT, Copyright (c) 2026 Germán Méndez Bravo. See [LICENSE](LICENSE).
+
+## Callback exception contract
+
+The UDP owner reports escaped timer/posted-callback exceptions through `L_EXC` and continues running. Repeating timers remain armed after a callback failure; explicit stop remains terminal. See [ARCHITECTURE.md](ARCHITECTURE.md#callback-exceptions-on-the-udp-owner-loop) for executor ownership and exception propagation.

@@ -90,6 +90,11 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	add_test(NAME reactor_udp_seam_header COMMAND reactor_udp_seam_header_test)
 	set_tests_properties(reactor_udp_seam_default reactor_udp_seam_header PROPERTIES TIMEOUT 60)
 
+	add_executable(reactor_callback_failure_test test/callback_failure_test.cc)
+	target_link_libraries(reactor_callback_failure_test PRIVATE reactor)
+	add_test(NAME reactor_callback_failure COMMAND reactor_callback_failure_test)
+	set_tests_properties(reactor_callback_failure PROPERTIES TIMEOUT 20)
+
 	add_executable(reactor_events_test test/events_test.cc)
 	target_link_libraries(reactor_events_test PRIVATE reactor)
 	add_test(NAME reactor_events COMMAND reactor_events_test)
