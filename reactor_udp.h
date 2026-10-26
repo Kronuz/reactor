@@ -144,7 +144,7 @@ public:
 		asio::co_spawn(reactor_.io(), receive_loop(), asio::detached);
 		thread_ = std::thread([this] {
 			while (!reactor_.io().stopped()) {
-				try { reactor_.io().run(); break; }
+				try { reactor_.run(); break; }
 				catch (...) { report_callback_exception(); }
 			}
 		});

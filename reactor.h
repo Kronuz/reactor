@@ -81,6 +81,18 @@ struct Abortable {
 	virtual void abort() = 0;
 };
 
+// True while the calling thread is inside a reactor loop's run(): a host asserts on it
+// before blocking (a loop must never wait on work). The library marks every loop it
+// drives; a host that runs a loop itself wraps that run() in a RunScope. Nests.
+inline unsigned& run_depth() noexcept { static thread_local unsigned depth = 0; return depth; }
+inline bool inside_run() noexcept { return run_depth() != 0; }
+struct RunScope {
+	RunScope() noexcept { ++run_depth(); }
+	~RunScope() { --run_depth(); }
+	RunScope(const RunScope&) = delete;
+	RunScope& operator=(const RunScope&) = delete;
+};
+
 // Bounded offload admission: a window so a saturated offload pool sheds load instead of
 // growing an unbounded backlog. try_enter() returning false is the "busy" signal (the
 // caller answers with whatever its protocol uses -- an HTTP 503, a NAK, a drop).
@@ -111,6 +123,8 @@ public:
 	Reactor& operator=(const Reactor&) = delete;
 
 	asio::io_context& io() { return io_; }
+	// Runs the loop with this thread marked inside_run(); the library's own threads use it.
+	std::size_t run() { RunScope scope; return io_.run(); }
 	asio::thread_pool* pool() { return pool_.get(); }   // null => inline
 	OffloadGate& gate() { return gate_; }
 
@@ -387,7 +401,7 @@ public:
 			guards_.emplace_back(asio::make_work_guard(r->io()));
 		}
 		// Every possible session destination must be running before admission.
-		for (auto& r : reactors_) { Reactor* rp = r.get(); threads_.emplace_back([rp] { rp->io().run(); }); }
+		for (auto& r : reactors_) { Reactor* rp = r.get(); threads_.emplace_back([rp] { rp->run(); }); }
 		if (shared) {
 			std::vector<Reactor*> raw;
 			for (auto& r : reactors_) { raw.push_back(r.get()); }

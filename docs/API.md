@@ -16,6 +16,14 @@
   connection parked on a half-read request or a full queue unwedges and the threads
   join instead of hanging.
 
+## Knowing you are on a loop
+
+`reactor::inside_run()` is true while the calling thread is inside a reactor loop's
+`run()`, and false on its offload pool and on the same thread after `run()` returns. A
+host asserts on it before blocking, since a loop that waits on work stalls every
+connection it serves. `TcpServer`, `UdpServer`, and `Reactor::run()` set it; a host that
+runs a loop itself (`io().run()`) wraps the call in a `reactor::RunScope`.
+
 ## UDP too (`reactor_udp.h`)
 
 The connectionless counterpart, `reactor::UdpServer`, is one reactor owning one bound

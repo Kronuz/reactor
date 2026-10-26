@@ -191,6 +191,49 @@ static void bounded_shared_acceptors() {
 	check(gate.stats().active == 0 && gate.try_enter().has_value(), "double release cannot refund another lease");
 }
 
+
+// inside_run(): true on a loop the library or a RunScope drives, false on its pool and
+// on the same thread once run() returns (a host reuses that thread to join).
+static void run_marker() {
+	check(!reactor::inside_run(), "[M] marker clear on a plain thread");
+	reactor::Reactor r(1, 8);
+	std::promise<bool> on_pool;
+	bool on_loop = false;
+	asio::post(r.io(), [&] {
+		on_loop = reactor::inside_run();
+		asio::post(*r.pool(), [&] { on_pool.set_value(reactor::inside_run()); });
+	});
+	r.run();
+	check(on_loop, "[M] marker set inside Reactor::run()");
+	check(!on_pool.get_future().get(), "[M] marker clear on the reactor's pool");
+	check(!reactor::inside_run(), "[M] marker clear on the same thread after run() returns");
+	{
+		reactor::RunScope outer;
+		{ reactor::RunScope inner; }
+		check(reactor::inside_run(), "[M] RunScope nests");
+	}
+	check(!reactor::inside_run(), "[M] RunScope restores on exit");
+	r.pool()->join();
+
+	std::atomic<int> session_loop{-1}, session_pool{-1};
+	reactor::Session probe = [&](asio::ip::tcp::socket socket, reactor::Reactor& sr) -> asio::awaitable<void> {
+		session_loop = reactor::inside_run();
+		session_pool = co_await asio::co_spawn(sr.pool()->get_executor(),
+			[]() -> asio::awaitable<int> { co_return reactor::inside_run(); }, asio::use_awaitable);
+		std::string reply = "done\n";
+		asio::error_code ec;
+		co_await asio::async_write(socket, asio::buffer(reply), asio::redirect_error(asio::use_awaitable, ec));
+	};
+	unsigned short port = free_port();
+	reactor::TcpServer svc(1, 1, 8, probe);
+	svc.start(port); wait_listen(port);
+	session_loop = -1; session_pool = -1;
+	round_trip(port, "x");
+	svc.stop();
+	check(session_loop == 1, "[M] marker set in a TcpServer session on its loop");
+	check(session_pool == 0, "[M] marker clear in work the session offloads");
+}
+
 int main() {
 	std::printf("== reactor runtime test ==\n");
 
@@ -339,7 +382,7 @@ int main() {
 			"stop reaps original idle reads and session callbacks before returning");
 		for (auto fd : clients) { if (fd >= 0) ::close(fd); }
 	}
-	bounded_queued_connections(); bounded_shared_acceptors();
+	bounded_queued_connections(); bounded_shared_acceptors(); run_marker();
 	std::printf("\n%s (%d failures)\n", g_fail == 0 ? "PASS" : "FAIL", g_fail);
 	return g_fail == 0 ? 0 : 1;
 }
