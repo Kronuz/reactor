@@ -70,9 +70,11 @@ int main() {
 	{
 		unsigned short port = free_udp_port();
 		std::atomic<int> got{0};
+		std::atomic<bool> marked{false};
 		std::mutex m; std::string last;
 		reactor::UdpServer srv([&](std::string_view d, const asio::ip::udp::endpoint&) {
 			{ std::lock_guard<std::mutex> lk(m); last.assign(d); }
+			marked.store(reactor::inside_run());
 			got.fetch_add(1);
 		});
 		reactor::UdpOptions o; o.address = "127.0.0.1"; srv.set_options(o);
@@ -82,6 +84,7 @@ int main() {
 		for (int i = 0; i < 200 && got.load() == 0; ++i) { std::this_thread::sleep_for(5ms); }
 		check(got.load() >= 1, "unicast datagram delivered to the handler");
 		{ std::lock_guard<std::mutex> lk(m); check(last == "ping-unicast", "unicast payload intact"); }
+		check(marked.load(), "[M] the handler runs inside_run()");
 	}
 
 	// [B] multicast loopback: two servers join the same group on the same port (reuse_port
