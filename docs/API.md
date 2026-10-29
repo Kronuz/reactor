@@ -24,6 +24,15 @@ host asserts on it before blocking, since a loop that waits on work stalls every
 connection it serves. `TcpServer`, `UdpServer`, and `Reactor::run()` set it; a host that
 runs a loop itself (`io().run()`) wraps the call in a `reactor::RunScope`.
 
+## How late a loop runs (`reactor_lag.h`)
+
+`Reactor::lag()` is a `LagProbe`: a timer on the loop that records how far past its deadline each wake ran.
+`TcpServer::enable_lag_probe()` starts one per reactor; any other loop calls `lag().start()` before it runs.
+The interval is 1 ms while `note_activity()` was called in the last second (a session start calls it) and 100 ms
+otherwise, so an idle loop wakes 10 times a second. `snapshot()` returns log2-microsecond buckets with 4
+sub-buckets each; `quantile_upper_us(q)` reads a percentile as its bucket's upper edge, so "1 ms" is the 1,024 us
+edge. A started probe allocates nothing.
+
 ## UDP too (`reactor_udp.h`)
 
 The connectionless counterpart, `reactor::UdpServer`, is one reactor owning one bound

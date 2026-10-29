@@ -40,6 +40,7 @@
 #include <cerrno>
 #include <asio.hpp>
 #include "connection_admission.h"
+#include "reactor_lag.h"
 #include <chrono>
 
 #include <netinet/in.h>
@@ -126,6 +127,7 @@ public:
 	// Runs the loop with this thread marked inside_run(); the library's own threads use it.
 	std::size_t run() { RunScope scope; return io_.run(); }
 	asio::thread_pool* pool() { return pool_.get(); }   // null => inline
+	LagProbe& lag() { return lag_; }                      // how late this loop runs (reactor_lag.h)
 	OffloadGate& gate() { return gate_; }
 
 	// Register an abortable so shutdown can unblock it; prunes expired entries.
@@ -164,6 +166,7 @@ public:
 
 private:
 	asio::io_context io_{1};
+	LagProbe lag_{io_};
 	std::unique_ptr<asio::thread_pool> pool_;
 	OffloadGate gate_;
 	std::mutex mtx_;
@@ -206,6 +209,7 @@ struct SessionControl : Abortable, std::enable_shared_from_this<SessionControl> 
 inline void launch_session(Reactor& reactor, const TimedSession& session, asio::ip::tcp::socket socket,
 	SessionContext context, ConnectionAdmission::Lease admission) {
 	auto control = std::make_shared<SessionControl>(reactor, std::move(admission));
+	reactor.lag().note_activity();
 	try {
 		// Install the slot and register abortability on the destination owner.
 		// The control is counted before posting, so the accept barrier covers it.
@@ -386,6 +390,11 @@ public:
 
 	std::size_t reactors() const { return n_; }
 	Reactor& reactor(std::size_t i) { return *reactors_[i]; }
+	// Run a LagProbe on every reactor from start() on; set before start(). Off by default.
+	void enable_lag_probe() {
+		if (started_) { throw std::logic_error("lag probe must be enabled before startup"); }
+		lag_probe_ = true;
+	}
 
 	// Bind + run all reactors (each on its own thread). Returns once the threads are
 	// listening; bind/listen errors propagate after cleanup. stop() tears down.
@@ -399,6 +408,7 @@ public:
 			// Admit every destination's socket service before accepting peers.
 			asio::ip::tcp::socket prepared(r->io());
 			guards_.emplace_back(asio::make_work_guard(r->io()));
+			if (lag_probe_) { r->lag().start(); }
 		}
 		// Every possible session destination must be running before admission.
 		for (auto& r : reactors_) { Reactor* rp = r.get(); threads_.emplace_back([rp] { rp->run(); }); }
@@ -439,7 +449,7 @@ public:
 		for (auto& control : accepts_) { control->wait(); }
 		for (auto& r : reactors_) { r->wait_sessions(); }
 		guards_.clear();
-		for (auto& r : reactors_) { r->io().stop(); }
+		for (auto& r : reactors_) { r->lag().stop(); r->io().stop(); }
 		for (auto& t : threads_) { if (t.joinable()) { t.join(); } }
 		threads_.clear();
 		for (auto& r : reactors_) { if (r->pool()) { r->pool()->stop(); r->pool()->join(); } }
@@ -448,6 +458,7 @@ public:
 
 private:
 	bool started_ = false;
+	bool lag_probe_ = false;
 	std::vector<std::shared_ptr<detail::AcceptControl>> accepts_;
 	std::size_t n_;
 	TimedSession session_;

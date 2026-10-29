@@ -99,4 +99,11 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	target_link_libraries(reactor_events_test PRIVATE reactor)
 	add_test(NAME reactor_events COMMAND reactor_events_test)
 	set_tests_properties(reactor_events PROPERTIES TIMEOUT 60)
+
+	add_executable(reactor_lag_test test/lag_test.cc)
+	target_link_libraries(reactor_lag_test PRIVATE reactor)
+	# Without asio's own block recycling the zero-allocation claim holds only because of the probe's slot.
+	target_compile_definitions(reactor_lag_test PRIVATE ASIO_DISABLE_SMALL_BLOCK_RECYCLING)
+	add_test(NAME reactor_lag COMMAND reactor_lag_test)
+	set_tests_properties(reactor_lag PROPERTIES TIMEOUT 60)
 endif()

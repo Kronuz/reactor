@@ -23,6 +23,9 @@ reactor_udp.h        The connectionless transport. reactor::{UdpOptions, Datagra
                      SND/RCV buffers). Includes reactor.h (reuses Reactor).
 reactor_trace.h      The logging seam and its contract: a no-op L_EXC unless the consumer
                      points REACTOR_TRACE_HEADER at its own header (target-wide).
+reactor_lag.h        reactor::LagProbe + LagSnapshot: how late a loop runs (a self-rearming timer, 1 ms
+                     while the loop saw activity in the last second, 100 ms idle; log2-us buckets with 4
+                     sub-buckets; no allocation once started). Reactor::lag(), TcpServer::enable_lag_probe().
 reactor_events.h     Loop primitives: reactor::PeriodicTimer (ev::timer replacement --
                      start/again/stop/repeat over steady_timer) + reactor::Signal (ev::async
                      replacement -- send() posts to the loop, coalescing). For lifting a
@@ -43,6 +46,8 @@ test/udp_seam_test.cc  ctest "reactor_udp_seam_default" / "reactor_udp_seam_head
                      logging seam compiled as consumers do, with the no-op L_EXC and with
                      REACTOR_TRACE_HEADER (test/udp_seam_trace.h). test/udp_helpers.h
                      holds the UDP tests' shared helpers.
+test/lag_test.cc     ctest "reactor_lag": the bucket arithmetic, a 6 ms busy handler in a >= 4,096 us bucket, zero
+                     allocations on the loop thread, 10 wakes/s idle vs ~1 ms busy, stop(), a probe per TcpServer reactor.
 test/events_test.cc  ctest "reactor_events": PeriodicTimer one-shot/repeat/again/stop +
                      Signal runs-on-the-loop and coalescing.
 examples/echo_server.cc   A runnable TCP echo server -- the smallest reactor::TcpServer
