@@ -17,10 +17,24 @@
 
 using namespace std::chrono_literals;
 
+// TSan's runtime defines operator new and delete in one object, so a replacement here would collide
+// with it at link time; the allocation count is taken by the plain and the ASan builds.
+#if defined(__SANITIZE_THREAD__)
+#define LAG_TEST_COUNT_ALLOCATIONS 0
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define LAG_TEST_COUNT_ALLOCATIONS 0
+#endif
+#endif
+#ifndef LAG_TEST_COUNT_ALLOCATIONS
+#define LAG_TEST_COUNT_ALLOCATIONS 1
+#endif
+
 // Counts allocations made while the calling thread has `counting` set.
 static thread_local bool counting = false;
 static std::atomic<std::uint64_t> g_allocations{0};
 
+#if LAG_TEST_COUNT_ALLOCATIONS
 void* operator new(std::size_t n) {
 	if (counting) { g_allocations.fetch_add(1, std::memory_order_relaxed); }
 	if (void* p = std::malloc(n ? n : 1)) { return p; }
@@ -31,6 +45,7 @@ void operator delete(void* p) noexcept { std::free(p); }
 void operator delete[](void* p) noexcept { std::free(p); }
 void operator delete(void* p, std::size_t) noexcept { std::free(p); }
 void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
+#endif
 
 static int g_fail = 0;
 static void check(bool ok, const std::string& m) {
@@ -131,7 +146,11 @@ int main() {
 		const auto allocated = g_allocations.load();
 		std::printf("     %llu wakes in 400 ms, %llu allocations on the loop thread\n", (unsigned long long)wakes, (unsigned long long)allocated);
 		check(wakes >= 50, "the probe was waking during the window");
-		check(allocated == 0, "zero allocations on the loop thread after start()");
+		if (LAG_TEST_COUNT_ALLOCATIONS) {
+			check(allocated == 0, "zero allocations on the loop thread after start()");
+		} else {
+			std::printf("  skip: allocation count (the TSan runtime owns operator new)\n");
+		}
 		guard.reset();
 		th.join();
 	}
