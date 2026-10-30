@@ -164,8 +164,8 @@ O(1) with no allocation and no lock, and are made on the reactor's loop. `abort_
 and `force_all()` called from another thread post their walk to the loop and return
 after it, because an Abortable's owner lives on that loop; a host that drives a loop
 on its own thread brackets the thread with `claim_loop()`/`release_loop()` so the walk
-is posted rather than run on the caller. `abort()` may run `untrack` on any node, and
-tracking after the walk aborts at once. The destructor calls `stop()`, so a `TcpServer`
+is posted rather than run on the caller. `abort()` may run `untrack` on any node. Tracking after the abort walk aborts at once, and after
+the force walk forces at once, so a request that starts late in shutdown cannot wait on a peer forever. The destructor calls `stop()`, so a `TcpServer`
 going out of scope tears down cleanly on its own.
 
 ## UDP: the connectionless path (`reactor_udp.h`)

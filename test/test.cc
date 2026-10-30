@@ -298,7 +298,12 @@ static void abort_on_loop() {
 	check(late.aborts == 1, "[O] an Abortable tracked after the walk is aborted at once");
 	r.force_all();
 	check(a.forces == 1 && late.forces == 1, "[O] force_all() ran force() on everything tracked");
-	asio::post(r.io(), [&] { r.untrack(a); r.untrack(late); });
+	Node after;
+	std::promise<void> after_done;
+	asio::post(r.io(), [&] { r.track(after); after_done.set_value(); });
+	after_done.get_future().wait();
+	check(after.aborts == 1 && after.forces == 1, "[O] an Abortable tracked after force_all() is aborted and forced at once");
+	asio::post(r.io(), [&] { r.untrack(a); r.untrack(late); r.untrack(after); });
 	r.io().stop();
 	loop.join();
 	r.release_loop();
@@ -349,6 +354,7 @@ static void force_after_grace() {
 }
 
 int main() {
+	std::setvbuf(stdout, nullptr, _IOLBF, 0);   // a hung run still shows how far it got
 	std::printf("== reactor runtime test ==\n");
 
 	// [A] one reactor, many clients.

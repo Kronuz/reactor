@@ -198,11 +198,14 @@ public:
 	void release_loop() noexcept { loops_.fetch_sub(1); }
 
 	// Register an abortable. Call on the loop (or with no loop running). O(1), no allocation.
-	// Tracking after abort_all() aborts it at once. The caller untracks (or destroys) it.
+	// Tracking after abort_all() aborts it at once, and after force_all() forces it too, so a
+	// request that starts late in shutdown cannot wait on a peer forever. The caller untracks
+	// (or destroys) it.
 	void track(Abortable& a) {
 		assert(loops_.load() == 0 || on_loop());
 		aborts_.add(a);
 		if (walked_) { a.abort(); }   // the walk has passed: abort it here
+		if (forced_) { a.force(); }   // and the grace is over: release what it waits on
 	}
 	void untrack(Abortable& a) noexcept { aborts_.remove(a); }
 
@@ -214,7 +217,7 @@ public:
 	}
 	// Stage two, after the grace: force() whatever is still tracked, on the loop.
 	void force_all() {
-		on_loop_sync([this] { aborts_.each([](Abortable& a) { a.force(); }); });
+		on_loop_sync([this] { forced_ = true; aborts_.each([](Abortable& a) { a.force(); }); });
 	}
 
 	void session_started() { std::lock_guard lock(session_mutex_); ++sessions_; }
@@ -247,6 +250,7 @@ private:
 	AdmissionGate gate_;
 	std::atomic<bool> aborting_{false};   // set by abort_all() on its caller; read by stopping()
 	bool walked_ = false;                 // loop thread only: abort_all()'s walk has begun
+	bool forced_ = false;                 // loop thread only: force_all()'s walk has begun
 	std::atomic<int> loops_{0};
 	std::mutex session_mutex_;
 	std::condition_variable session_changed_;
