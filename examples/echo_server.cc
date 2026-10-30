@@ -29,8 +29,8 @@ static asio::awaitable<void> echo(asio::ip::tcp::socket socket, reactor::Reactor
 int main(int argc, char** argv) {
 	unsigned short port = argc > 1 ? static_cast<unsigned short>(std::atoi(argv[1])) : 9000;
 
-	// 4 reactors, no offload pool (echo is trivial and never blocks the loop).
-	reactor::TcpServer server(4, 0, 64, echo);
+	// 4 reactors, at most 64 requests in flight each.
+	reactor::TcpServer server(4, 64, echo);
 	server.start(port);
 	std::printf("echo server on :%u across %zu reactors (Ctrl-C to stop)\n", port, server.reactors());
 

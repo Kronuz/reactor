@@ -37,7 +37,7 @@ static void check(bool ok, const std::string& m) {
 }
 
 // ---- a line-echo Session: read a line, reply "echo: <line>\n", keep-alive until EOF ----
-static asio::awaitable<void> echo_session(asio::ip::tcp::socket socket, reactor::Reactor& r) {
+static asio::awaitable<void> echo_session(asio::ip::tcp::socket socket, reactor::Reactor&) {
 	using asio::use_awaitable;
 	try {
 		asio::error_code oe;
@@ -55,17 +55,7 @@ static asio::awaitable<void> echo_session(asio::ip::tcp::socket socket, reactor:
 			std::string line = buf.substr(0, nl);
 			buf.erase(0, nl + 1);
 
-			std::string reply;
-			if (line == "slow" && r.pool()) {
-				// Offload the "slow" work to the reactor's pool -- the reactor stays free.
-				reply = co_await asio::co_spawn(r.pool()->get_executor(),
-					[]() -> asio::awaitable<std::string> {
-						std::this_thread::sleep_for(std::chrono::milliseconds(120));
-						co_return std::string("slow-done");
-					}, use_awaitable);
-			} else {
-				reply = "echo: " + line;
-			}
+			std::string reply = "echo: " + line;
 			reply += "\n";
 			co_await asio::async_write(socket, asio::buffer(reply), use_awaitable);
 		}
@@ -130,7 +120,7 @@ static void bounded_queued_connections() {
 	// The accepting executor stays available while the other destination is
 	// deliberately stalled. Queued originals must already consume admission.
 	auto counts = std::make_shared<RetirementCounts>();
-	reactor::TcpServer service(2, 0, 0, [counts](asio::ip::tcp::socket socket, reactor::Reactor&) {
+	reactor::TcpServer service(2, 0, [counts](asio::ip::tcp::socket socket, reactor::Reactor&) {
 		return idle_session(std::move(socket), counts);
 	});
 	service.set_connection_limit(2);
@@ -160,7 +150,7 @@ static void bounded_queued_connections() {
 static void bounded_shared_acceptors() {
 	for (bool reuse : {false, true}) {
 		auto counts = std::make_shared<RetirementCounts>();
-		reactor::TcpServer service(4, 0, 0, [counts](asio::ip::tcp::socket socket, reactor::Reactor&) {
+		reactor::TcpServer service(4, 0, [counts](asio::ip::tcp::socket socket, reactor::Reactor&) {
 			return idle_session(std::move(socket), counts);
 		});
 		service.set_connection_limit(3);
@@ -192,20 +182,15 @@ static void bounded_shared_acceptors() {
 }
 
 
-// inside_run(): true on a loop the library or a RunScope drives, false on its pool and
-// on the same thread once run() returns (a host reuses that thread to join).
+// inside_run(): true on a loop the library or a RunScope drives, false on a plain thread
+// and on the same thread once run() returns (a host reuses that thread to join).
 static void run_marker() {
 	check(!reactor::inside_run(), "[M] marker clear on a plain thread");
-	reactor::Reactor r(1, 8);
-	std::promise<bool> on_pool;
+	reactor::Reactor r;
 	bool on_loop = false;
-	asio::post(r.io(), [&] {
-		on_loop = reactor::inside_run();
-		asio::post(*r.pool(), [&] { on_pool.set_value(reactor::inside_run()); });
-	});
+	asio::post(r.io(), [&] { on_loop = reactor::inside_run(); });
 	r.run();
 	check(on_loop, "[M] marker set inside Reactor::run()");
-	check(!on_pool.get_future().get(), "[M] marker clear on the reactor's pool");
 	check(!reactor::inside_run(), "[M] marker clear on the same thread after run() returns");
 	{
 		reactor::RunScope outer;
@@ -213,25 +198,154 @@ static void run_marker() {
 		check(reactor::inside_run(), "[M] RunScope nests");
 	}
 	check(!reactor::inside_run(), "[M] RunScope restores on exit");
-	r.pool()->join();
 
-	std::atomic<int> session_loop{-1}, session_pool{-1};
-	reactor::Session probe = [&](asio::ip::tcp::socket socket, reactor::Reactor& sr) -> asio::awaitable<void> {
+	std::atomic<int> session_loop{-1};
+	reactor::Session probe = [&](asio::ip::tcp::socket socket, reactor::Reactor&) -> asio::awaitable<void> {
 		session_loop = reactor::inside_run();
-		session_pool = co_await asio::co_spawn(sr.pool()->get_executor(),
-			[]() -> asio::awaitable<int> { co_return reactor::inside_run(); }, asio::use_awaitable);
 		std::string reply = "done\n";
 		asio::error_code ec;
 		co_await asio::async_write(socket, asio::buffer(reply), asio::redirect_error(asio::use_awaitable, ec));
 	};
 	unsigned short port = free_port();
-	reactor::TcpServer svc(1, 1, 8, probe);
+	reactor::TcpServer svc(1, 8, probe);
 	svc.start(port); wait_listen(port);
-	session_loop = -1; session_pool = -1;
+	session_loop = -1;
 	round_trip(port, "x");
 	svc.stop();
 	check(session_loop == 1, "[M] marker set in a TcpServer session on its loop");
-	check(session_pool == 0, "[M] marker clear in work the session offloads");
+}
+
+// AdmissionGate: the cap, the refusal count, RAII leases, and "0 means no cap".
+static void admission_gate() {
+	reactor::AdmissionGate gate(2);
+	auto a = gate.enter(), b = gate.enter(), c = gate.enter();
+	check(a && b && !c && gate.inflight == 2 && gate.rejected == 1, "[G] the third entry over a limit of 2 is refused and counted");
+	b.reset();
+	auto d = gate.enter();
+	check(d && gate.inflight == 2, "[G] a released lease frees its slot");
+	auto moved = std::move(a); a.reset();
+	check(moved && gate.inflight == 2, "[G] moving a lease keeps exactly one slot");
+	moved.reset(); d.reset();
+	check(gate.inflight == 0, "[G] every lease refunds on release");
+	reactor::AdmissionGate open(0);
+	std::vector<reactor::AdmissionGate::Lease> leases;
+	for (int i = 0; i != 1000; ++i) { leases.push_back(open.enter()); }
+	check(open.inflight == 1000 && open.rejected == 0, "[G] a limit of 0 admits everything and counts it");
+	reactor::Reactor r(1);
+	check(r.gate().try_enter() && !r.gate().try_enter(), "[G] a Reactor's gate takes its admission limit");
+}
+
+// The intrusive list: removal during a walk, destruction unlinking, and linear total cost.
+struct Node : reactor::Abortable {
+	std::function<void()> on_abort;
+	unsigned aborts = 0, forces = 0;
+	void abort() override { ++aborts; if (on_abort) { on_abort(); } }
+	void force() override { ++forces; }
+};
+static void abort_list() {
+	{
+		reactor::Reactor r;
+		Node a, b, c;
+		r.track(a); r.track(b); r.track(c);   // walked c, b, a
+		c.on_abort = [&] { r.untrack(b); };
+		r.abort_all();
+		check(c.aborts == 1 && b.aborts == 0 && a.aborts == 1, "[L] a callback may untrack the node the walk would visit next");
+		r.force_all();
+		check(c.forces == 1 && b.forces == 0 && a.forces == 1, "[L] force_all reaches what is still tracked");
+	}
+	{
+		reactor::Reactor r;
+		unsigned aborts = 0;
+		{
+			Node gone;
+			gone.on_abort = [&] { ++aborts; };
+			r.track(gone);
+		}   // destroyed while tracked: unlinked
+		r.abort_all();
+		check(aborts == 0, "[L] a destroyed Abortable leaves the list");
+	}
+	{
+		reactor::Reactor r;
+		const std::size_t n = 200000;
+		std::vector<Node> nodes(n);
+		const auto began = std::chrono::steady_clock::now();
+		for (auto& node : nodes) { r.track(node); }
+		for (auto& node : nodes) { r.untrack(node); }
+		const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - began).count();
+		std::printf("  [L] %zu track+untrack pairs -> %.1f ms\n", n, ms);
+		check(ms < 2000.0, "[L] tracking is O(1) per call (a linear scan per call would take minutes at this size)");
+	}
+}
+
+// abort_all()/force_all() from another thread run the callbacks on the reactor's loop and
+// return after they have run; a track() after the walk aborts at once.
+static void abort_on_loop() {
+	reactor::Reactor r;
+	r.claim_loop();
+	std::thread loop([&] { auto guard = asio::make_work_guard(r.io()); r.run(); });
+	Node a;
+	std::atomic<bool> a_on_loop{false}, force_on_loop{false};
+	a.on_abort = [&] { a_on_loop = r.on_loop(); };
+	asio::post(r.io(), [&] { r.track(a); });
+	std::promise<void> tracked; asio::post(r.io(), [&] { tracked.set_value(); }); tracked.get_future().wait();
+	r.abort_all();
+	check(a.aborts == 1 && a_on_loop, "[O] abort_all() ran abort() on the loop and returned after it");
+	check(r.stopping(), "[O] stopping() is true after abort_all()");
+	Node late;
+	std::promise<void> late_done;
+	asio::post(r.io(), [&] { r.track(late); late_done.set_value(); });
+	late_done.get_future().wait();
+	check(late.aborts == 1, "[O] an Abortable tracked after the walk is aborted at once");
+	r.force_all();
+	check(a.forces == 1 && late.forces == 1, "[O] force_all() ran force() on everything tracked");
+	asio::post(r.io(), [&] { r.untrack(a); r.untrack(late); });
+	r.io().stop();
+	loop.join();
+	r.release_loop();
+	(void)force_on_loop;
+}
+
+// A session that ignores abort() (a write to a peer that stopped reading) is force()d once
+// the shutdown grace has passed, and stop() returns shortly after.
+static void force_after_grace() {
+	struct Shared { std::atomic<int> aborts{0}, forces{0}, started{0}; std::atomic<long long> forced_ns{0}; };
+	struct Stubborn : reactor::Abortable {
+		explicit Stubborn(Shared& s, asio::ip::tcp::socket& sock) : shared(s), socket(sock) {}
+		Shared& shared; asio::ip::tcp::socket& socket;
+		void abort() override { ++shared.aborts; }
+		void force() override {
+			++shared.forces;
+			shared.forced_ns = std::chrono::steady_clock::now().time_since_epoch().count();
+			asio::error_code ec; socket.close(ec);
+		}
+	};
+	Shared shared;
+	reactor::Session session = [&shared](asio::ip::tcp::socket socket, reactor::Reactor& r) -> asio::awaitable<void> {
+		Stubborn stub(shared, socket);
+		r.track(stub); ++shared.started;
+		co_await asio::this_coro::reset_cancellation_state(asio::disable_cancellation());   // like a request mid-write
+		char byte; asio::error_code ec;
+		co_await socket.async_read_some(asio::buffer(&byte, 1), asio::redirect_error(asio::use_awaitable, ec));
+		r.untrack(stub);
+	};
+	reactor::TcpServer svc(1, 8, session);
+	svc.set_shutdown_grace(std::chrono::milliseconds(150));
+	unsigned short port = free_port();
+	svc.start(port); wait_listen(port);
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));   // the probe connections have ended
+	const int base = shared.started.load();
+	int fd = connect_port(port);
+	for (int i = 0; i != 200 && shared.started.load() == base; ++i) { std::this_thread::sleep_for(std::chrono::milliseconds(5)); }
+	const auto began = std::chrono::steady_clock::now();
+	svc.stop();
+	const auto total = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - began).count();
+	const auto forced = std::chrono::duration<double, std::milli>(
+		std::chrono::steady_clock::time_point(std::chrono::steady_clock::duration(shared.forced_ns.load())) - began).count();
+	std::printf("  [F] force after %.0f ms, stop() returned after %.0f ms\n", forced, total);
+	check(shared.aborts == 1 && shared.forces == 1, "[F] abort() once, then force() once");
+	check(forced >= 140.0, "[F] force() waits out the shutdown grace");
+	check(total < 3000.0, "[F] stop() returns once the forced session ends");
+	if (fd >= 0) { ::close(fd); }
 }
 
 int main() {
@@ -240,7 +354,7 @@ int main() {
 	// [A] one reactor, many clients.
 	{
 		unsigned short port = free_port();
-		reactor::TcpServer svc(1, 2, 64, echo_session);
+		reactor::TcpServer svc(1, 64, echo_session);
 		svc.start(port); wait_listen(port);
 		int ok = serve_count(port, 30);
 		std::printf("  [A] 1 reactor -> %d/30 echoed\n", ok);
@@ -250,7 +364,7 @@ int main() {
 	// [B] N reactors, SO_REUSEPORT and the portable shared-acceptor.
 	{
 		unsigned short port = free_port();
-		reactor::TcpServer svc(4, 2, 64, echo_session);
+		reactor::TcpServer svc(4, 64, echo_session);
 		reactor::BindOptions b; b.reuse_port = true; svc.set_bind_options(b);
 		svc.start(port); wait_listen(port);
 		int ok = serve_count(port, 40);
@@ -259,58 +373,41 @@ int main() {
 	}
 	{
 		unsigned short port = free_port();
-		reactor::TcpServer svc(4, 2, 64, echo_session);   // reuse_port off -> shared acceptor
+		reactor::TcpServer svc(4, 64, echo_session);   // reuse_port off -> shared acceptor
 		svc.start(port); wait_listen(port);
 		int ok = serve_count(port, 40);
 		std::printf("  [B] 4 reactors shared-acceptor -> %d/40 echoed\n", ok);
 		check(ok == 40, "shared acceptor: all served (portable path)");
 	}
 
-	// [C] offload: a "slow" request runs on the pool; the reactor still serves others.
+	// [D] shutdown while a session waits on an Abortable must not hang: stop() runs
+	// abort() on the reactor's loop, which ends the wait, and the join completes.
 	{
-		unsigned short port = free_port();
-		reactor::TcpServer svc(1, 4, 64, echo_session);
-		svc.start(port); wait_listen(port);
-		std::atomic<bool> slow_done{false};
-		std::thread slow([&] { round_trip(port, "slow"); slow_done.store(true); });
-		std::this_thread::sleep_for(std::chrono::milliseconds(20));   // slow is now on the pool
-		auto t0 = std::chrono::steady_clock::now();
-		std::string fast = round_trip(port, "quick");
-		double fast_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-		slow.join();
-		std::printf("  [C] offload: fast during slow -> %.1f ms, slow_done=%d\n", fast_ms, slow_done.load());
-		check(fast == "echo: quick", "fast request served during a slow (offloaded) one");
-		check(fast_ms < 100.0, "the reactor stays free while the slow request runs on the pool");
-	}
-
-	// [D] shutdown while a session is blocked on an Abortable must not hang: stop()
-	// aborts it so the blocked read returns and the join completes.
-	{
-		struct Gate : reactor::Abortable {
-			std::mutex m; std::condition_variable cv; bool go = false;
-			void wait() { std::unique_lock<std::mutex> lk(m); cv.wait(lk, [this] { return go; }); }
-			void abort() override { { std::lock_guard<std::mutex> lk(m); go = true; } cv.notify_all(); }
+		struct Wait : reactor::Abortable {
+			Wait(asio::io_context& io, std::atomic<bool>& flag) : timer(io, std::chrono::hours(1)), flag_(flag) {}
+			void abort() override { flag_ = true; timer.cancel(); }
+			asio::steady_timer timer;
+			std::atomic<bool>& flag_;
 		};
+		std::atomic<bool> aborted{false};
 		unsigned short port = free_port();
-		reactor::Session blocking = [](asio::ip::tcp::socket socket, reactor::Reactor& r) -> asio::awaitable<void> {
-			auto gate = std::make_shared<Gate>();
-			r.track(gate);
-			// hand the blocking wait to the pool so it doesn't wedge the reactor
-			co_await asio::co_spawn(r.pool()->get_executor(),
-				[gate]() -> asio::awaitable<void> { gate->wait(); co_return; }, asio::use_awaitable);
-			(void)socket;
-			co_return;
+		reactor::Session waiting = [&aborted](asio::ip::tcp::socket, reactor::Reactor& r) -> asio::awaitable<void> {
+			Wait wait(r.io(), aborted);
+			r.track(wait);
+			asio::error_code ec;
+			co_await wait.timer.async_wait(asio::redirect_error(asio::use_awaitable, ec));
+			r.untrack(wait);
 		};
-		auto* svc = new reactor::TcpServer(1, 2, 64, blocking);
+		auto* svc = new reactor::TcpServer(1, 64, waiting);
 		svc->start(port); wait_listen(port);
-		int fd = connect_port(port);   // triggers the blocking session
+		int fd = connect_port(port);   // starts a session that waits an hour
 		std::this_thread::sleep_for(std::chrono::milliseconds(60));
 		std::atomic<bool> stopped{false};
 		std::thread stopper([svc, &stopped] { svc->stop(); stopped.store(true); });
 		for (int i = 0; i < 500 && !stopped.load(); ++i) { std::this_thread::sleep_for(std::chrono::milliseconds(10)); }
 		bool ok = stopped.load();
-		std::printf("  [D] stop() with a blocked session -> %s\n", ok ? "returned" : "HUNG");
-		check(ok, "stop() aborts a session blocked on an Abortable (no shutdown hang)");
+		std::printf("  [D] stop() with a waiting session -> %s\n", ok ? "returned" : "HUNG");
+		check(ok && aborted.load(), "stop() aborts a session waiting on an Abortable (no shutdown hang)");
 		if (ok) { stopper.join(); delete svc; } else { stopper.detach(); }
 		if (fd >= 0) { ::close(fd); }
 	}
@@ -318,13 +415,13 @@ int main() {
 	// Reap a pending shared accept for every round-robin destination.
 	for (unsigned count = 0; count != 5; ++count) {
 		auto port = free_port();
-		reactor::TcpServer service(4, 0, 0, echo_session);
+		reactor::TcpServer service(4, 0, echo_session);
 		service.start(port); wait_listen(port);
 		for (unsigned index = 0; index != count; ++index) { check(round_trip(port, "pending") == "echo: pending", "shared accept destination reached before retirement"); }
 		service.stop(); service.stop();
 	}
 	for (unsigned count = 0; count != 20; ++count) {
-		reactor::TcpServer service(4, 0, 0, echo_session);
+		reactor::TcpServer service(4, 0, echo_session);
 		service.start(free_port()); service.stop();
 	}
 	{
@@ -334,17 +431,17 @@ int main() {
 			explicit Reentrant(reactor::Reactor& value) : owner(value) {}
 			void abort() override { ++calls; owner.abort_all(); }
 		};
-		reactor::Reactor owner(0, 0);
-		auto first = std::make_shared<Reentrant>(owner); owner.track(first); owner.abort_all();
-		auto late = std::make_shared<Reentrant>(owner); owner.track(late);
-		check(first->calls == 1 && late->calls == 1, "shutdown callbacks may reenter and late tracked waits are aborted");
+		reactor::Reactor owner;
+		Reentrant first(owner); owner.track(first); owner.abort_all();
+		Reentrant late(owner); owner.track(late);
+		check(first.calls == 1 && late.calls == 1, "shutdown callbacks may reenter and late tracked waits are aborted");
 	}
 	{
 		int fd = ::socket(AF_INET, SOCK_STREAM, 0);
 		sockaddr_in address{}; address.sin_family = AF_INET; address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 		check(::bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0, "reserve occupied bind endpoint");
 		::listen(fd, 1); socklen_t size = sizeof(address); ::getsockname(fd, reinterpret_cast<sockaddr*>(&address), &size);
-		reactor::TcpServer service(4, 0, 0, echo_session);
+		reactor::TcpServer service(4, 0, echo_session);
 		reactor::BindOptions bind; bind.address = "127.0.0.1"; service.set_bind_options(bind);
 		bool failed = false;
 		try { service.start(ntohs(address.sin_port)); }
@@ -355,7 +452,7 @@ int main() {
 
 	for (auto reactors : {1u, 4u}) {
 		for (bool reuse : {false, true}) {
-			reactor::TcpServer service(reactors, 0, 0, echo_session);
+			reactor::TcpServer service(reactors, 0, echo_session);
 			reactor::BindOptions bind; bind.address = "127.0.0.1"; bind.reuse_port = reuse;
 			service.set_bind_options(bind);
 			const auto port = free_port(); service.start(port);
@@ -367,7 +464,7 @@ int main() {
 	}
 	for (auto reactors : {1u, 4u}) {
 		auto counts = std::make_shared<RetirementCounts>();
-		reactor::TcpServer service(reactors, 0, 0,
+		reactor::TcpServer service(reactors, 0,
 			[counts](asio::ip::tcp::socket socket, reactor::Reactor&) {
 				return idle_session(std::move(socket), counts);
 			});
@@ -382,7 +479,7 @@ int main() {
 			"stop reaps original idle reads and session callbacks before returning");
 		for (auto fd : clients) { if (fd >= 0) ::close(fd); }
 	}
-	bounded_queued_connections(); bounded_shared_acceptors(); run_marker();
+	bounded_queued_connections(); bounded_shared_acceptors(); run_marker(); admission_gate(); abort_list(); abort_on_loop(); force_after_grace();
 	std::printf("\n%s (%d failures)\n", g_fail == 0 ? "PASS" : "FAIL", g_fail);
 	return g_fail == 0 ? 0 : 1;
 }

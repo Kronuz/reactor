@@ -84,10 +84,8 @@ using Datagram = std::function<void(std::string_view, const asio::ip::udp::endpo
 
 class UdpServer {
 public:
-	// `workers` offload threads (0 => everything inline on the loop, the usual case for a
-	// gossip protocol) and an offload admission window, same as a reactor::Reactor.
-	explicit UdpServer(Datagram on_datagram, std::size_t workers = 0, int queue_limit = 0)
-		: reactor_(workers, queue_limit), socket_(reactor_.io()), on_datagram_(std::move(on_datagram)) {}
+	explicit UdpServer(Datagram on_datagram)
+		: socket_(reactor_.io()), on_datagram_(std::move(on_datagram)) {}
 
 	~UdpServer() { stop(); }
 
@@ -142,23 +140,26 @@ public:
 		}
 
 		asio::co_spawn(reactor_.io(), receive_loop(), asio::detached);
-		thread_ = std::thread([this] {
-			while (!reactor_.io().stopped()) {
-				try { reactor_.run(); break; }
-				catch (...) { report_callback_exception(); }
-			}
-		});
+		reactor_.claim_loop();
+		try {
+			thread_ = std::thread([this] {
+				while (!reactor_.io().stopped()) {
+					try { reactor_.run(); break; }
+					catch (...) { report_callback_exception(); }
+				}
+				reactor_.release_loop();   // the loop is over: abort_all() now walks inline
+			});
+		} catch (...) { reactor_.release_loop(); throw; }
 	}
 
-	// Abort in-flight offload work, stop the loop (abandons the pending receive), join,
-	// drain the pool -- the same order as TcpServer::stop(). The socket + io_context are
+	// Abort tracked work, stop the loop (abandons the pending receive), join -- the same
+	// order as TcpServer::stop(). The socket + io_context are
 	// torn down by the destructor after the thread has joined.
 	void stop() {
 		if (!thread_.joinable()) { return; }
 		reactor_.abort_all();
 		reactor_.io().stop();
 		thread_.join();
-		if (reactor_.pool()) { reactor_.pool()->stop(); reactor_.pool()->join(); }
 	}
 
 	// Send to the configured multicast group (start() must have set a group).

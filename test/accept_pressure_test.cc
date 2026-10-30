@@ -104,7 +104,7 @@ void qualify(bool reuse_port) {
 	const auto port = unused_port();
 	Socket first, second;
 	reactor::TcpServer server(
-		2, 0, 0,
+		2, 0,
 		reactor::TimedSession{[](asio::ip::tcp::socket socket, reactor::Reactor &owner,
 								 reactor::SessionContext) { return echo(std::move(socket), owner); }},
 		8);

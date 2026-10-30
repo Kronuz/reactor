@@ -182,13 +182,13 @@ int main() {
 
 	// [E] a TcpServer with the probe on runs one per reactor; without it nothing runs.
 	{
-		reactor::TcpServer off(2, 0, 0, [](asio::ip::tcp::socket, reactor::Reactor&) -> asio::awaitable<void> { co_return; });
+		reactor::TcpServer off(2, 0, [](asio::ip::tcp::socket, reactor::Reactor&) -> asio::awaitable<void> { co_return; });
 		off.start(0);
 		std::this_thread::sleep_for(250ms);
 		check(off.reactor(0).lag().snapshot().wakes == 0 && off.reactor(1).lag().snapshot().wakes == 0, "a server without the probe records nothing");
 		off.stop();
 
-		reactor::TcpServer on(2, 0, 0, [](asio::ip::tcp::socket, reactor::Reactor&) -> asio::awaitable<void> { co_return; });
+		reactor::TcpServer on(2, 0, [](asio::ip::tcp::socket, reactor::Reactor&) -> asio::awaitable<void> { co_return; });
 		on.enable_lag_probe();
 		on.start(0);
 		std::this_thread::sleep_for(550ms);

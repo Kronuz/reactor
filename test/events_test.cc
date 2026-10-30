@@ -24,7 +24,7 @@ static void check(bool ok, const std::string& m) {
 int main() {
 	std::printf("== reactor events test ==\n");
 
-	reactor::Reactor r(0, 0);
+	reactor::Reactor r;
 	auto guard = asio::make_work_guard(r.io());   // keep run() alive while we drive it
 	std::thread th([&r] { r.io().run(); });
 	auto ex = r.io().get_executor();

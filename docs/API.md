@@ -7,19 +7,25 @@
 - **One port, two bind modes, chosen automatically.** `SO_REUSEPORT` (Linux) so each
   reactor binds its own acceptor and the kernel load-balances; a single portable
   shared acceptor everywhere else (macOS/BSD reject a second same-port bind).
-- **A per-reactor offload pool** (`Reactor::pool()`) for the blocking or CPU-heavy
-  work that must not run on the loop, with a **bounded admission gate**
-  (`Reactor::gate()`) so a saturated pool sheds load instead of growing an unbounded
-  backlog.
-- **A clean shutdown.** Register anything a worker can block on as an `Abortable`
-  (`Reactor::track()`); `stop()` aborts them all *before* stopping the loops, so a
-  connection parked on a half-read request or a full queue unwedges and the threads
-  join instead of hanging.
+- **A bounded admission gate per reactor** (`Reactor::gate()`, an `AdmissionGate`):
+  `enter()` returns a move-only lease, or an empty one when the reactor already has
+  `admission_limit` requests in flight, so overload is refused (an HTTP 503) instead of
+  queued. A limit of 0 admits everything and still counts. There is no worker pool:
+  work that must wait suspends its coroutine.
+- **A clean shutdown.** Register anything a request can wait on as an `Abortable`
+  (`Reactor::track(a)`, with `untrack(a)` when it is done). The hooks are intrusive, so
+  tracking allocates nothing and costs O(1), and they are touched on the reactor's own
+  loop only. `stop()` runs `abort()` on each (on its loop) before stopping the loops: a
+  read ends at its next checkpoint, a write is left to finish. After the shutdown grace
+  (`TcpServer::set_shutdown_grace`, 5 s by default) it runs `force()` on whatever is
+  still tracked, which closes the socket a stalled peer holds, and then waits for the
+  sessions to end. The wait for a session's own work has no bound: a session must honor
+  `abort()`.
 
 ## Knowing you are on a loop
 
 `reactor::inside_run()` is true while the calling thread is inside a reactor loop's
-`run()`, and false on its offload pool and on the same thread after `run()` returns. A
+`run()`, and false on any other thread and on the same thread after `run()` returns. A
 host asserts on it before blocking, since a loop that waits on work stalls every
 connection it serves. `TcpServer`, `UdpServer`, and `Reactor::run()` set it; a host that
 runs a loop itself (`io().run()`) wraps the call in a `reactor::RunScope`.

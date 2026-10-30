@@ -8,22 +8,24 @@ Part of [Kronuz C++ Libraries](https://github.com/Kronuz/cpp-libraries), a colle
 ![Header-only](https://img.shields.io/badge/header--only-yes-green.svg)
 
 A thread-per-core server runtime on standalone Asio and C++20 coroutines: the
-event-loop pool, the accept loop, the offload pool, and a shutdown that never
+event-loop pool, the accept loop, per-reactor admission, and a shutdown that never
 hangs, with the protocol left entirely to you. Write one coroutine per
 connection; reactor runs it. For TCP and UDP services that should not each
 reinvent their plumbing.
 
-![reactor: a connection's life, from accept to its reactor, with blocking work offloaded](assets/architecture.svg)
+![reactor: a connection's life, from accept to its reactor, admitted and tracked](assets/architecture.svg)
 
 ## ✨ Highlights
 
 - **Shared-nothing loops**: N reactors on N threads, no global lock.
 - **One port, best bind mode**: `SO_REUSEPORT` per reactor on Linux, one shared
   acceptor elsewhere, chosen automatically.
-- **Offload with backpressure**: each reactor has a worker pool and a bounded
-  admission gate, so saturation sheds load instead of queueing forever.
-- **Shutdown that finishes**: `stop()` aborts tracked waits, reaps accepts, waits
-  for sessions to return, then joins.
+- **Admission with backpressure**: each reactor has a bounded `AdmissionGate`, so
+  saturation sheds load instead of queueing forever. Nothing runs off the loops; a
+  session that must wait suspends its coroutine.
+- **Shutdown that finishes**: `stop()` asks every tracked request to stop (an
+  O(1) intrusive list, run on its own loop), reaps accepts, gives sessions a bounded
+  grace, forces what a stalled peer still holds, then joins.
 - **Connection limits** with exact accounting, and accept retry under descriptor
   pressure.
 - **UDP too**: `UdpServer` with multicast, for gossip and discovery. A handler that
@@ -67,7 +69,7 @@ asio::awaitable<void> echo(asio::ip::tcp::socket socket, reactor::Reactor&) {
 }
 
 int main() {
-	reactor::TcpServer server(/*reactors*/ 4, /*offload workers*/ 2, /*queue*/ 256, echo);
+	reactor::TcpServer server(/*reactors*/ 4, /*in flight per reactor*/ 256, echo);
 	server.start(8080);   // binds, listens, and returns once every acceptor is ready
 	// ... run until a signal ...
 	server.stop();        // call from outside the reactors
@@ -88,7 +90,7 @@ reactors on a laptop.
 ## 📚 Documentation
 
 - [docs/API.md](docs/API.md): what a Session gets, and the UDP server.
-- [ARCHITECTURE.md](ARCHITECTURE.md): the loops, the bind modes, the offload pool,
+- [ARCHITECTURE.md](ARCHITECTURE.md): the loops, the bind modes, admission,
   and the shutdown and admission contracts.
 - [AGENTS.md](AGENTS.md): repository map, invariants, and traps.
 

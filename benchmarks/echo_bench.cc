@@ -1,7 +1,6 @@
 // echo_bench -- the runtime's request throughput and latency: an echo TcpServer plus a bank
 // of concurrent blocking clients doing request/response round-trips over loopback. Measures
-// what the reactor pool delivers (accept + read + write across N reactors), and shows the
-// offload path stays free (a pooled "slow" request does not throttle the fast ones).
+// what the reactor pool delivers (accept + read + write across N reactors).
 //
 //   cmake --build build && ./build/reactor_echo_bench [reactors] [clients] [ops-per-client]
 
@@ -50,7 +49,7 @@ int main(int argc, char** argv) {
 	int ops = argc > 3 ? std::atoi(argv[3]) : 20000;
 
 	unsigned short port = 39000;
-	reactor::TcpServer server(reactors, 0, 256, echo);
+	reactor::TcpServer server(reactors, 256, echo);
 	server.start(port);
 	std::this_thread::sleep_for(std::chrono::milliseconds(100));
 

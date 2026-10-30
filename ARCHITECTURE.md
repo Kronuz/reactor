@@ -4,24 +4,24 @@ How the runtime is put together, and the path a connection takes from a listenin
 port to a Session coroutine. Read `README.md` first for the shape and the rationale;
 this is the map.
 
-![reactor: a connection's life and the offload that keeps the loop free](assets/architecture.svg)
+![reactor: a connection's life, from accept to its reactor, admitted and tracked](assets/architecture.svg)
 
 <!-- Diagram: assets/architecture.svg. Edit the D2 source below and re-render with:
      d2 --theme 0 --pad 20 <this-source>.d2 assets/architecture.svg
 
 ```d2
-# reactor: a connection's life and the offload that keeps the loop free.
+# reactor: a connection's life, from accept to its reactor, admitted and tracked.
 direction: down
 c: "client" { style.fill: "#faf3e6" }
 acc: "acceptor\n(SO_REUSEPORT: one per reactor, or one round-robin)" { style.fill: "#eef2f7" }
 r: "reactor loop\n(io_context, one thread)" { style.fill: "#e8f5ee" }
 co: "per-connection coroutine\n(reads framed messages)" { style.fill: "#e8f5ee" }
-pool: "offload thread-pool\n(bounded gate; blocking work)" { style.fill: "#eef2f7" }
+gate: "admission gate\n(per reactor; refuses when full)" { style.fill: "#eef2f7" }
 c -> acc: "connect"
 acc -> r: "accept"
 r -> co: "co_spawn"
-co -> pool: "co_await (blocking IO/CPU)"
-pool -> co: "resume with result"
+co -> gate: "enter a lease\nper request"
+gate -> co: "admitted, or refused"
 co -> c: "write reply"
 ```
 -->
@@ -37,7 +37,7 @@ not depended on here (see [What lives above](#what-lives-above-not-here)).
 
 The library's two transports — `reactor.h` (TCP) and `reactor_udp.h` (UDP) — draw one
 seam: the **runtime** below, the **protocol** above. Everything here is transport
-mechanics — loops, threads, acceptors/sockets, offload, shutdown. Nothing here knows a
+mechanics — loops, threads, acceptors/sockets, admission, shutdown. Nothing here knows a
 wire format.
 
 ```
@@ -46,15 +46,15 @@ wire format.
      ------------------------------ the seam --------------------------------
   runtime   TcpServer     N reactors on N threads, one port, a Session per connection
             UdpServer     one reactor, one bound UDP socket, a Datagram per packet
-            Reactor       one io_context (one thread) + offload pool + gate + abortables
-            OffloadGate   bounded offload admission (shed when full)
-            Abortable     something shutdown must release so a blocked worker unwedges
+            Reactor       one io_context (one thread) + admission gate + abortables
+            AdmissionGate bounded admission (shed when full), leases
+            Abortable     something shutdown must release; abort() then force()
             BindOptions   TCP: address / reuse_port / tcp_nodelay / backlog
             UdpOptions    UDP: reuse_addr/port, multicast group/interface/loop/ttl, buffers
             detail::accept_loop / shared_accept_loop   the two bind strategies
 ```
 
-The two transports share `Reactor` (the io_context + offload pool + abortable registry)
+The two transports share `Reactor` (the io_context + gate + intrusive abortable list)
 and the abort→stop→join shutdown; they differ only in the connection model — TCP accepts
 and spawns a Session coroutine per connection, UDP runs one receive loop and calls the
 Datagram handler per packet. UDP has no accept and no per-connection state, so its
@@ -64,15 +64,15 @@ so the protocol's own timers run on that same loop.
 ## Runtime: shared-nothing reactors
 
 A `TcpServer` runs **N `io_context`s on N threads** — thread-per-core, no shared
-state between them, no global lock, no cross-core bounce. Each `Reactor` also owns an
-optional Asio `thread_pool` for offload and a bounded offload window.
+state between them, no global lock, no cross-core bounce. Each `Reactor` also owns a
+bounded admission gate and the list of abortables to release at shutdown.
 
 ```
-  TcpServer(reactors=4, workers=2, queue=256, session)
-    Reactor 0  [ io_context | thread ]  + thread_pool(2)  + gate  + abortables
-    Reactor 1  [ io_context | thread ]  + thread_pool(2)  + gate  + abortables
-    Reactor 2  [ io_context | thread ]  + thread_pool(2)  + gate  + abortables
-    Reactor 3  [ io_context | thread ]  + thread_pool(2)  + gate  + abortables
+  TcpServer(reactors=4, admission_limit=256, session)
+    Reactor 0  [ io_context | thread ]  + gate  + abortables
+    Reactor 1  [ io_context | thread ]  + gate  + abortables
+    Reactor 2  [ io_context | thread ]  + gate  + abortables
+    Reactor 3  [ io_context | thread ]  + gate  + abortables
 ```
 
 A reactor's `io_context` is constructed with a concurrency hint of `1` (a single
@@ -112,7 +112,7 @@ thread falling through and exiting before the first connection is ever routed to
       -> acceptor accepts (per-reactor, or shared -> round-robin onto reactor r)
       -> co_spawn( session(socket, r) )  on r's io_context, detached
       -> your Session coroutine runs the whole connection:
-             read bytes ... maybe co_await r.pool() for blocking work ... write ...
+             read bytes ... co_await whatever it must wait for ... write ...
              keep-alive loop ... co_return on EOF/close
 ```
 
@@ -120,44 +120,53 @@ The Session owns the connection start to finish. Framing, parsing, dispatch,
 back-pressure, keep-alive — all yours. The runtime only accepted the socket and
 picked the reactor.
 
-## Offload: keeping the loop free
+## Admission: nothing runs off the loop
 
-Blocking or CPU-heavy work must not run on a reactor thread — it would stall every
-other connection on that loop. A Session offloads it to its reactor's pool:
+Blocking or CPU-heavy work must not run on a reactor thread: it would stall every
+other connection on that loop. The runtime has no worker pool. A Session that must
+wait suspends its coroutine, and a host that has work for a device runs it in its own
+pool and resumes the coroutine on the loop.
 
-```cpp
-auto result = co_await asio::co_spawn(r.pool()->get_executor(),
-    [&]() -> asio::awaitable<T> { co_return do_blocking_work(); },
-    asio::use_awaitable);
-```
+`AdmissionGate` bounds how many requests a reactor holds at once. `gate().enter()`
+returns a move-only lease, or an empty one when the reactor is full, which is the
+"busy" signal: the Session answers with whatever its protocol uses (an HTTP 503, a
+NAK, a drop) instead of letting a backlog grow without limit. `try_enter()`/`leave()`
+are the unscoped form, and `rejected` counts the refusals. A limit of 0 admits
+everything and still counts.
 
-`OffloadGate` bounds how much offload is admitted at once. `gate().try_enter()`
-returning `false` is the "busy" signal — the Session answers with whatever its
-protocol uses (an HTTP 503, a NAK, a drop) instead of letting the pool's backlog
-grow without limit. A `workers == 0` reactor has no pool (`pool()` is null), meaning
-"run everything inline on the loop".
+## Shutdown: abort, grace, force, stop, join
 
-## Shutdown: abort, stop, join — in that order
-
-The hard part of any server runtime. A worker can be parked deep in a `co_await` —
-a streaming read waiting for more request body, a receive waiting on a queue that
-will never fill — and simply stopping the `io_context` would strand it and hang the
-join. So `stop()` runs a strict order:
+The hard part of any server runtime. A request can be parked deep in a `co_await`,
+and simply stopping the `io_context` would strand it and hang the join. So `stop()`
+runs a strict order:
 
 ```
   stop():
-    1. reactor.abort_all()   for every reactor  -- release Abortables; blocked workers unwedge
+    1. reactor.abort_all()   for every reactor  -- on each loop: abort() every tracked Abortable
     2. close and reap accepts on their owner loops -- all peer socket services remain alive
-    3. clear work guards                          -- idle reactors may now drain
-    4. io.stop()             for every reactor    -- stop the loops
-    5. thread.join()         for every thread     -- loops have exited; joins return
-    6. pool.stop() + join()  for every pool        -- drain offload
+    3. wait for the sessions, up to the grace      -- a read ends at abort(); a write may finish
+    4. reactor.force_all()   if any are left       -- force() closes what a stalled peer holds
+    5. wait for the sessions                       -- each ends once its socket is closed
+    6. clear work guards                           -- idle reactors may now drain
+    7. io.stop() for every reactor, then thread.join() for every thread
 ```
 
-Anything a Session can block on registers with `Reactor::track()` as an `Abortable`;
-step 1 calls its `abort()`. `track()` holds `weak_ptr`s and prunes expired entries,
-so a connection that finished normally leaves nothing behind. The destructor calls
-`stop()`, so a `TcpServer` going out of scope tears down cleanly on its own.
+Anything a Session can wait on registers with `Reactor::track(a)` as an `Abortable`;
+step 1 calls its `abort()`, which requests: the wait ends at its next checkpoint, and a
+write is left to finish. Step 4's `force()` is the second stage: it releases the
+resource a write is blocked on. The bound is therefore the grace
+(`set_shutdown_grace`, 5 s by default) plus the time to unwind the sessions; a Session
+that ignores `abort()` and holds no socket `force()` can close waits for as long as it
+runs.
+
+The list is intrusive (two pointers in the `Abortable`), so `track` and `untrack` are
+O(1) with no allocation and no lock, and are made on the reactor's loop. `abort_all()`
+and `force_all()` called from another thread post their walk to the loop and return
+after it, because an Abortable's owner lives on that loop; a host that drives a loop
+on its own thread brackets the thread with `claim_loop()`/`release_loop()` so the walk
+is posted rather than run on the caller. `abort()` may run `untrack` on any node, and
+tracking after the walk aborts at once. The destructor calls `stop()`, so a `TcpServer`
+going out of scope tears down cleanly on its own.
 
 ## UDP: the connectionless path (`reactor_udp.h`)
 
@@ -175,7 +184,7 @@ so a connection that finished normally leaves nothing behind. The destructor cal
         run() on the thread
       send(data)      -> send_to(data, group:port)
       send_to(d, ep)  -> one datagram to ep
-      stop()          -> abort_all -> io.stop() -> join -> drain pool  (same order as TCP)
+      stop()          -> abort_all -> io.stop() -> join  (same order as TCP)
 ```
 
 Two things are load-bearing and specific to UDP:
