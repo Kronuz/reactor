@@ -236,19 +236,22 @@ public:
 	bool stopping() const noexcept { return aborting_.load(); }
 
 private:
-	// Runs f on the loop and returns after it ran. The completion state is shared, so the
-	// loop's last touch of it cannot outlive this frame.
+	// Runs f on the loop and returns after it ran. The wait uses members, not heap state: a
+	// shutdown may run with the process out of descriptors, where even a sanitizer's first
+	// lookup of a shared_ptr's type can fail. The posted handler notifies under the lock,
+	// so it never touches the reactor after the caller can return.
 	template <class F> void on_loop_sync(F&& f) {
 		if (loops_.load() == 0 || on_loop()) { f(); return; }
-		struct Done { std::mutex mutex; std::condition_variable changed; bool done = false; };
-		auto state = std::make_shared<Done>();
-		asio::post(io_, [&f, state] {
+		std::lock_guard<std::mutex> call(sync_call_);
+		sync_done_ = false;
+		asio::post(io_, [this, &f] {
 			f();
-			{ std::lock_guard lock(state->mutex); state->done = true; }
-			state->changed.notify_all();
+			std::lock_guard<std::mutex> lock(sync_mutex_);
+			sync_done_ = true;
+			sync_changed_.notify_all();
 		});
-		std::unique_lock lock(state->mutex);
-		state->changed.wait(lock, [&] { return state->done; });
+		std::unique_lock<std::mutex> lock(sync_mutex_);
+		sync_changed_.wait(lock, [this] { return sync_done_; });
 	}
 
 	AbortList aborts_;              // before io_: pending handlers die with io_, then the list
@@ -259,6 +262,9 @@ private:
 	bool walked_ = false;                 // loop thread only: abort_all()'s walk has begun
 	bool forced_ = false;                 // loop thread only: force_all()'s walk has begun
 	std::atomic<int> loops_{0};
+	std::mutex sync_call_, sync_mutex_;     // on_loop_sync: one waiter at a time
+	std::condition_variable sync_changed_;
+	bool sync_done_ = false;
 	std::mutex session_mutex_;
 	std::condition_variable session_changed_;
 	std::size_t sessions_ = 0;
