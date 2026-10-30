@@ -277,6 +277,19 @@ static void abort_list() {
 	}
 }
 
+// Runs f on r's loop and returns once it has run (shared state: nothing outlives the frame).
+template <class F> static void on_loop_wait(reactor::Reactor& r, F f) {
+	struct State { std::mutex m; std::condition_variable cv; bool done = false; };
+	auto state = std::make_shared<State>();
+	asio::post(r.io(), [f = std::move(f), state]() mutable {
+		f();
+		{ std::lock_guard<std::mutex> lk(state->m); state->done = true; }
+		state->cv.notify_all();
+	});
+	std::unique_lock<std::mutex> lk(state->m);
+	state->cv.wait(lk, [&] { return state->done; });
+}
+
 // abort_all()/force_all() from another thread run the callbacks on the reactor's loop and
 // return after they have run; a track() after the walk aborts at once.
 static void abort_on_loop() {
@@ -284,30 +297,24 @@ static void abort_on_loop() {
 	r.claim_loop();
 	std::thread loop([&] { auto guard = asio::make_work_guard(r.io()); r.run(); });
 	Node a;
-	std::atomic<bool> a_on_loop{false}, force_on_loop{false};
+	std::atomic<bool> a_on_loop{false};
 	a.on_abort = [&] { a_on_loop = r.on_loop(); };
-	asio::post(r.io(), [&] { r.track(a); });
-	std::promise<void> tracked; asio::post(r.io(), [&] { tracked.set_value(); }); tracked.get_future().wait();
+	on_loop_wait(r, [&] { r.track(a); });
 	r.abort_all();
 	check(a.aborts == 1 && a_on_loop, "[O] abort_all() ran abort() on the loop and returned after it");
 	check(r.stopping(), "[O] stopping() is true after abort_all()");
 	Node late;
-	std::promise<void> late_done;
-	asio::post(r.io(), [&] { r.track(late); late_done.set_value(); });
-	late_done.get_future().wait();
+	on_loop_wait(r, [&] { r.track(late); });
 	check(late.aborts == 1, "[O] an Abortable tracked after the walk is aborted at once");
 	r.force_all();
 	check(a.forces == 1 && late.forces == 1, "[O] force_all() ran force() on everything tracked");
 	Node after;
-	std::promise<void> after_done;
-	asio::post(r.io(), [&] { r.track(after); after_done.set_value(); });
-	after_done.get_future().wait();
+	on_loop_wait(r, [&] { r.track(after); });
 	check(after.aborts == 1 && after.forces == 1, "[O] an Abortable tracked after force_all() is aborted and forced at once");
-	asio::post(r.io(), [&] { r.untrack(a); r.untrack(late); r.untrack(after); });
+	on_loop_wait(r, [&] { r.untrack(a); r.untrack(late); r.untrack(after); });
 	r.io().stop();
 	loop.join();
 	r.release_loop();
-	(void)force_on_loop;
 }
 
 // A session that ignores abort() (a write to a peer that stopped reading) is force()d once

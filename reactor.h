@@ -51,7 +51,6 @@
 #include <atomic>
 #include <cstddef>
 #include <functional>
-#include <future>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
@@ -237,11 +236,19 @@ public:
 	bool stopping() const noexcept { return aborting_.load(); }
 
 private:
+	// Runs f on the loop and returns after it ran. The completion state is shared, so the
+	// loop's last touch of it cannot outlive this frame.
 	template <class F> void on_loop_sync(F&& f) {
 		if (loops_.load() == 0 || on_loop()) { f(); return; }
-		std::promise<void> done;
-		asio::post(io_, [&] { f(); done.set_value(); });
-		done.get_future().wait();
+		struct Done { std::mutex mutex; std::condition_variable changed; bool done = false; };
+		auto state = std::make_shared<Done>();
+		asio::post(io_, [&f, state] {
+			f();
+			{ std::lock_guard lock(state->mutex); state->done = true; }
+			state->changed.notify_all();
+		});
+		std::unique_lock lock(state->mutex);
+		state->changed.wait(lock, [&] { return state->done; });
 	}
 
 	AbortList aborts_;              // before io_: pending handlers die with io_, then the list
