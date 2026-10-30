@@ -42,6 +42,11 @@
 #include <asio.hpp>
 #include "connection_admission.h"
 #include "reactor_lag.h"
+#ifdef REACTOR_TRACE_HEADER
+#  include REACTOR_TRACE_HEADER
+#endif
+#include "reactor_trace.h"
+#include <cstdio>
 #include <chrono>
 
 #include <netinet/in.h>
@@ -322,8 +327,26 @@ inline void launch_session(Reactor& reactor, const TimedSession& session, asio::
 inline bool retryable_accept_error(const asio::error_code& error) noexcept {
 	return error == asio::error::no_descriptors || error.value() == ENFILE ||
 		error == asio::error::no_buffer_space || error == asio::error::no_memory ||
-		error == asio::error::connection_aborted || error == asio::error::interrupted ||
-		error == asio::error::try_again || error == asio::error::would_block;
+		error == asio::error::interrupted || error == asio::error::try_again || error == asio::error::would_block;
+}
+
+// An error that belongs to one pending connection, not to the listener: that connection is
+// skipped and the loop accepts the next. macOS reports a peer that reset while queued as
+// EINVAL; Linux documents the network errors as to be treated like EAGAIN.
+inline bool per_connection_accept_error(const asio::error_code& error) noexcept {
+	if (error == asio::error::connection_aborted || error == asio::error::connection_reset) { return true; }
+	switch (error.value()) {
+		case ECONNABORTED: case ECONNRESET: case EPROTO:
+		case ENETDOWN: case ENETUNREACH: case EHOSTDOWN: case EHOSTUNREACH: case EOPNOTSUPP: case ENOPROTOOPT:
+#ifdef ENONET
+		case ENONET:
+#endif
+			return error.category() == asio::system_category();
+#ifdef __APPLE__
+		case EINVAL: return error.category() == asio::system_category();
+#endif
+		default: return false;
+	}
 }
 
 struct AcceptControl {
@@ -332,9 +355,13 @@ struct AcceptControl {
 	std::unique_ptr<asio::ip::tcp::acceptor> acceptor;
 	asio::steady_timer retry_timer;
 	std::chrono::milliseconds retry_delay{10};
+	// Consecutive per-connection errors skipped without a pause; a listener that only ever
+	// fails this way backs off like a resource error instead of spinning.
+	unsigned skipped = 0;
 	asio::awaitable<bool> retry(const asio::error_code& error) {
 		if (stopping.load()) { co_return false; }
-		if (!retryable_accept_error(error)) { throw asio::system_error(error); }
+		if (per_connection_accept_error(error) && ++skipped <= 64) { co_return true; }
+		if (!per_connection_accept_error(error) && !retryable_accept_error(error)) { throw asio::system_error(error); }
 		retry_timer.expires_after(retry_delay);
 		retry_delay = std::min(retry_delay * 2, std::chrono::milliseconds(1000));
 		asio::error_code timer_error;
@@ -363,6 +390,14 @@ struct AcceptControl {
 		}
 	}
 	void finish(std::exception_ptr error = {}) {
+		bool was_listening;
+		{ std::lock_guard lock(mutex); was_listening = ready; }
+		if (error && was_listening) {
+			// The listener died after startup: nobody waits on startup_error, so say so.
+			try { std::rethrow_exception(error); }
+			catch (const std::exception& e) { std::fprintf(stderr, "reactor: the TCP listener stopped accepting: %s\n", e.what()); L_EXC("ERROR: the TCP listener stopped accepting"); }
+			catch (...) { std::fprintf(stderr, "reactor: the TCP listener stopped accepting\n"); L_EXC("ERROR: the TCP listener stopped accepting"); }
+		}
 		acceptor.reset(); // owner executor; no socket object can escape runtime retirement
 		{ std::lock_guard lock(mutex); startup_error = error; finished = true; }
 		changed.notify_all();
@@ -394,6 +429,7 @@ inline asio::awaitable<void> accept_loop(Reactor* reactor, const TimedSession* s
 		tcp::socket socket = co_await acceptor.async_accept(asio::redirect_error(asio::use_awaitable, error));
 		if (error) { if (co_await control->retry(error)) { continue; } co_return; }
 		control->retry_delay = std::chrono::milliseconds(10);
+		control->skipped = 0;
 		if (control->stopping.load()) { co_return; }
 		auto context = SessionContext{std::chrono::steady_clock::now()};
 		std::optional<ConnectionAdmission::Lease> lease;
@@ -433,6 +469,7 @@ inline asio::awaitable<void> shared_accept_loop(std::vector<Reactor*> reactors, 
 		tcp::socket socket = co_await acceptor.async_accept(r->io(), asio::redirect_error(asio::use_awaitable, error));
 		if (error) { if (co_await control->retry(error)) { continue; } co_return; }
 		control->retry_delay = std::chrono::milliseconds(10);
+		control->skipped = 0;
 		if (control->stopping.load()) { co_return; }
 		auto context = SessionContext{std::chrono::steady_clock::now()};
 		std::optional<ConnectionAdmission::Lease> lease;

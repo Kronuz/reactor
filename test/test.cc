@@ -1,5 +1,5 @@
 // reactor_test -- validates the generic Asio server runtime with a line-echo protocol:
-// serving across N reactors (both bind modes), offload to the per-reactor pool, and the
+// serving across N reactors (both bind modes), the admission gate, and the
 // shutdown-abort path (a session blocked on an Abortable must unwedge so stop() returns).
 
 #include <arpa/inet.h>
@@ -360,6 +360,38 @@ static void force_after_grace() {
 	if (fd >= 0) { ::close(fd); }
 }
 
+// [N] A connection that resets while queued must not end the listener (macOS reports it
+// as EINVAL from accept); a real listener failure is not retried.
+static void accept_survives_reset() {
+	using reactor::detail::per_connection_accept_error;
+	using reactor::detail::retryable_accept_error;
+	const auto sys = [](int e) { return asio::error_code(e, asio::system_category()); };
+	check(per_connection_accept_error(sys(ECONNABORTED)) && per_connection_accept_error(sys(EPROTO)) &&
+	      per_connection_accept_error(sys(ECONNRESET)), "[N] ECONNABORTED, EPROTO and ECONNRESET skip one connection");
+#ifdef __APPLE__
+	check(per_connection_accept_error(sys(EINVAL)), "[N] EINVAL (a reset pending connection) skips one connection on macOS");
+#endif
+	check(!per_connection_accept_error(sys(EBADF)) && !retryable_accept_error(sys(EBADF)) &&
+	      !per_connection_accept_error(sys(EMFILE)) && retryable_accept_error(sys(EMFILE)),
+	      "[N] a bad listener is fatal; descriptor exhaustion backs off");
+
+	for (bool reuse : {false, true}) {
+		unsigned short port = free_port();
+		reactor::TcpServer svc(2, 100, echo_session);
+		if (reuse) { reactor::BindOptions b; b.reuse_port = true; svc.set_bind_options(b); }
+		svc.start(port); wait_listen(port);
+		for (int i = 0; i < 1500; ++i) {
+			int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+			sockaddr_in a{}; a.sin_family = AF_INET; a.sin_port = htons(port); ::inet_pton(AF_INET, "127.0.0.1", &a.sin_addr);
+			::connect(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a));
+			linger lg{1, 0}; ::setsockopt(fd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg)); ::close(fd);
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(100));
+		check(serve_count(port, 8) == 8, reuse ? "[N] after reset pending connections the listener serves (reuse_port)"
+		                                       : "[N] after reset pending connections the listener serves (shared acceptor)");
+	}
+}
+
 int main() {
 	std::setvbuf(stdout, nullptr, _IOLBF, 0);   // a hung run still shows how far it got
 	std::printf("== reactor runtime test ==\n");
@@ -492,7 +524,7 @@ int main() {
 			"stop reaps original idle reads and session callbacks before returning");
 		for (auto fd : clients) { if (fd >= 0) ::close(fd); }
 	}
-	bounded_queued_connections(); bounded_shared_acceptors(); run_marker(); admission_gate(); abort_list(); abort_on_loop(); force_after_grace();
+	bounded_queued_connections(); bounded_shared_acceptors(); run_marker(); admission_gate(); abort_list(); abort_on_loop(); force_after_grace(); accept_survives_reset();
 	std::printf("\n%s (%d failures)\n", g_fail == 0 ? "PASS" : "FAIL", g_fail);
 	return g_fail == 0 ? 0 : 1;
 }
