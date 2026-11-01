@@ -1,6 +1,8 @@
 # reactor: N shared-nothing reactors on one port; each runs its sessions and admits their requests.
-# Render: d2 --layout elk --sketch --theme 302 docs/reactor.d2 docs/reactor.svg
-vars: { d2-config: { layout-engine: elk; theme-id: 302; sketch: true; pad: 24 } }
+# Render: d2 docs/reactor.d2 docs/reactor.svg
+vars: { d2-config: { layout-engine: elk; theme-id: 302; sketch: true; pad: 24; theme-overrides: { B1: "#8C7B7E"; B2: "#C25B73"; N2: "#C25B73" } } }
+style.fill: transparent
+
 direction: right
 
 port: "one port\nshared or\nper-reactor acceptor" { style.fill: "#F4F1EA" }
