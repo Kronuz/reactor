@@ -113,8 +113,9 @@ Both servers echo every value unchanged (the bench checks each round trip).
 | 4, 32 | 32.3 to 33.2 | 32.4 | 133.0 to 137.4 | 124.1 to 135.3 |
 
 On the i9 plain Asio is 3 to 4% faster on one thread, and on four threads the two overlap. On the M4
-Pro both servers land at 32,000 to 34,000 round trips per second on one thread or four, so that
-machine's loopback, not the server, sets the rate there.
+Pro both servers land at 32,000 to 34,000 round trips per second on one thread or four, so the
+server does not set the rate there; the host's load average was about 12 on its 14 cores during
+the runs, and the cause was not isolated.
 
 Apple M4 Pro (arm64), macOS 26.7.2, and Intel Core i9-9980HK (x86_64), macOS 15.8.1, both with
 Apple clang 17.0.0 and `-O3 -DNDEBUG`, at `acf87e1`:
