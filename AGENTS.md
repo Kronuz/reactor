@@ -56,6 +56,7 @@ examples/echo_server.cc   A runnable TCP echo server -- the smallest reactor::Tc
                      (a Session that reads and writes back). `nc localhost <port>` to try it.
 benchmarks/echo_bench.cc  The reactor pool's request throughput + latency: an echo server +
                      concurrent blocking clients over loopback (~55k req/s at 4 reactors here).
+docs/reactor.d2      The README and ARCHITECTURE diagram's source (docs/reactor.svg is rendered from it).
 ```
 
 ## The API surface

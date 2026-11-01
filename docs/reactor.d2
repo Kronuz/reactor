@@ -1,0 +1,37 @@
+# reactor: N shared-nothing reactors on one port; each runs its sessions and admits their requests.
+# Render: d2 --layout elk --sketch --theme 302 docs/reactor.d2 docs/reactor.svg
+vars: { d2-config: { layout-engine: elk; theme-id: 302; sketch: true; pad: 24 } }
+direction: right
+
+port: "one port\nshared or\nper-reactor acceptor" { style.fill: "#F4F1EA" }
+
+r1: "reactor 1 · one thread" {
+  label.near: top-left
+  style.font-size: 18
+  style.fill: "#EEF2F7"
+  co: "session coroutines" { style.fill: "#FFFFFF" }
+  gate: "admission gate" { style.fill: "#FFFFFF" }
+  co -> gate
+}
+
+r2: "reactor 2 · one thread" {
+  label.near: top-left
+  style.font-size: 18
+  style.fill: "#EEF2F7"
+  co: "session coroutines" { style.fill: "#FFFFFF" }
+  gate: "admission gate" { style.fill: "#FFFFFF" }
+  co -> gate
+}
+
+rn: "reactor N · one thread" {
+  label.near: top-left
+  style.font-size: 18
+  style.fill: "#EEF2F7"
+  co: "session coroutines" { style.fill: "#FFFFFF" }
+  gate: "admission gate" { style.fill: "#FFFFFF" }
+  co -> gate
+}
+
+port -> r1.co: "accept"
+port -> r2.co: "accept"
+port -> rn.co: "accept"

@@ -4,27 +4,9 @@ How the runtime is put together, and the path a connection takes from a listenin
 port to a Session coroutine. Read `README.md` first for the shape and the rationale;
 this is the map.
 
-![reactor: a connection's life, from accept to its reactor, admitted and tracked](assets/architecture.svg)
+![reactor: one port feeds N reactors, each a thread running its session coroutines behind an admission gate](docs/reactor.svg)
 
-<!-- Diagram: assets/architecture.svg. Edit the D2 source below and re-render with:
-     d2 --theme 0 --pad 20 <this-source>.d2 assets/architecture.svg
-
-```d2
-# reactor: a connection's life, from accept to its reactor, admitted and tracked.
-direction: down
-c: "client" { style.fill: "#faf3e6" }
-acc: "acceptor\n(SO_REUSEPORT: one per reactor, or one round-robin)" { style.fill: "#eef2f7" }
-r: "reactor loop\n(io_context, one thread)" { style.fill: "#e8f5ee" }
-co: "per-connection coroutine\n(reads framed messages)" { style.fill: "#e8f5ee" }
-gate: "admission gate\n(per reactor; refuses when full)" { style.fill: "#eef2f7" }
-c -> acc: "connect"
-acc -> r: "accept"
-r -> co: "co_spawn"
-co -> gate: "enter a lease\nper request"
-gate -> co: "admitted, or refused"
-co -> c: "write reply"
-```
--->
+<!-- Source: docs/reactor.d2; the render command is in its header. -->
 
 ## Dependencies
 
