@@ -103,6 +103,7 @@ Not for:
 - [ARCHITECTURE.md](ARCHITECTURE.md): the loops, the bind modes, admission, and the shutdown
   stages.
 - [AGENTS.md](AGENTS.md): repository map, invariants, and traps.
+- [CHANGELOG.md](CHANGELOG.md): dated changes.
 - [Catalog entry](https://github.com/Kronuz/cpp-libraries/blob/main/AGENTS.md#reactor) in Kronuz
   C++ Libraries.
 

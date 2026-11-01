@@ -55,7 +55,8 @@ test/events_test.cc  ctest "reactor_events": PeriodicTimer one-shot/repeat/again
 examples/echo_server.cc   A runnable TCP echo server -- the smallest reactor::TcpServer
                      (a Session that reads and writes back). `nc localhost <port>` to try it.
 benchmarks/echo_bench.cc  The reactor pool's request throughput + latency: an echo server +
-                     concurrent blocking clients over loopback (~55k req/s at 4 reactors here).
+                     concurrent blocking clients over loopback; prints req/s and the worst round-trip
+                     (`reactor_echo_bench [reactors] [clients] [ops-per-client]`).
 docs/reactor.d2      The README and ARCHITECTURE diagram's source (docs/reactor.svg is rendered from it).
 ```
 
