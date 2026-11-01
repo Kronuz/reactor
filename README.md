@@ -96,6 +96,36 @@ Not for:
 - Blocking work inside a session: it stalls every connection on that reactor's thread. Hand it to
   a thread pool and `co_await` the result.
 
+## ⚡ Performance
+
+`reactor_echo_bench --asio` runs an echo server and blocking clients on the same machine, each
+client doing 20,000 round trips of its own four-byte value over loopback TCP, and reports
+thousands of round trips per second, the range over two runs. *reactor* is `TcpServer` with
+one reactor and 8 clients, or four reactors and 32 clients. The comparator, *plain Asio*, is
+one acceptor and one `io_context` run by the same number of threads, with the same
+read-then-write coroutine and no admission gate, on
+[standalone Asio](https://github.com/chriskohlhoff/asio) `asio-1-36-0` (reactor's own pin).
+Both servers echo every value unchanged (the bench checks each round trip).
+
+| Threads, clients | reactor, Apple M4 Pro | plain Asio, M4 Pro | reactor, Intel Core i9-9980HK | plain Asio, i9 |
+|---|---:|---:|---:|---:|
+| 1, 8 | 33.4 to 33.9 | 33.5 to 34.1 | 106.3 to 107.2 | 110.3 to 110.4 |
+| 4, 32 | 32.3 to 33.2 | 32.4 | 133.0 to 137.4 | 124.1 to 135.3 |
+
+On the i9 plain Asio is 3 to 4% faster on one thread, and on four threads the two overlap. On the M4
+Pro both servers land at 32,000 to 34,000 round trips per second on one thread or four, so that
+machine's loopback, not the server, sets the rate there.
+
+Apple M4 Pro (arm64), macOS 26.7.2, and Intel Core i9-9980HK (x86_64), macOS 15.8.1, both with
+Apple clang 17.0.0 and `-O3 -DNDEBUG`, at `acf87e1`:
+
+```sh
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target reactor_echo_bench
+./build/reactor_echo_bench --asio 1 8 20000
+./build/reactor_echo_bench --asio 4 32 20000
+```
+
 ## 📚 Documentation
 
 - [docs/API.md](docs/API.md): what a session gets, the UDP server, and the callback failure
@@ -115,8 +145,9 @@ ctest --test-dir build --output-on-failure
 ./build/reactor_echo_bench
 ```
 
-The benchmark (`reactor_echo_bench [reactors] [clients] [ops-per-client]`, by default 4, 32 and
-20000) runs an echo server against concurrent loopback clients and prints throughput and latency.
+The benchmark (`reactor_echo_bench [--asio] [reactors] [clients] [ops-per-client]`, by default
+4, 32 and 20000) runs an echo server against concurrent loopback clients and prints throughput and
+the worst round trip; `--asio` adds the plain Asio server.
 
 ## 🤝 Contributing
 
