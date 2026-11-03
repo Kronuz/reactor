@@ -4,7 +4,7 @@
 #
 # Header-only. A TcpServer runs N shared-nothing reactors on N threads, binds them to one
 # port (SO_REUSEPORT or a portable shared acceptor), and runs a caller-supplied Session
-# coroutine per connection. The protocol is entirely the caller's; this owns the runtime.
+# task per connection. The protocol is entirely the caller's; this owns the runtime.
 
 cmake_minimum_required(VERSION 3.16)
 project(reactor LANGUAGES CXX)
@@ -30,12 +30,18 @@ if(ASIO_INCLUDE_DIR STREQUAL "")
 	set(ASIO_INCLUDE_DIR "${asio_SOURCE_DIR}/asio/include")
 endif()
 
+# --- task (cancellable coroutines; the Session type and the loops' scheduler) ---
+# The one place the pin lives: phase/cancellation-c2's head, to move to task step C3's commit.
+# Set FETCHCONTENT_SOURCE_DIR_TASK to build against a local checkout instead.
+FetchContent_Declare(task GIT_REPOSITORY https://github.com/Kronuz/task.git GIT_TAG cbfee340f34a95db69b9061d3d4ff339bff5849f)
+FetchContent_MakeAvailable(task)
+
 # --- the reactor runtime (header-only) ---
 add_library(reactor INTERFACE)
 target_include_directories(reactor INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}" "${ASIO_INCLUDE_DIR}")
 target_compile_features(reactor INTERFACE cxx_std_20)
 target_compile_definitions(reactor INTERFACE ASIO_STANDALONE)
-target_link_libraries(reactor INTERFACE Threads::Threads)
+target_link_libraries(reactor INTERFACE Threads::Threads task::asio)
 add_library(reactor::reactor ALIAS reactor)
 
 # --- TLS configuration (reactor_tls.h), when OpenSSL 3 is available ---
@@ -74,6 +80,11 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	add_test(NAME reactor COMMAND reactor_test)
 	set_tests_properties(reactor PROPERTIES TIMEOUT 60)
 
+	add_executable(reactor_session_test test/session_test.cc)
+	target_link_libraries(reactor_session_test PRIVATE reactor)
+	add_test(NAME reactor_session COMMAND reactor_session_test)
+	set_tests_properties(reactor_session PROPERTIES TIMEOUT 60)
+
 	add_executable(reactor_udp_test test/udp_test.cc)
 	target_link_libraries(reactor_udp_test PRIVATE reactor)
 	add_test(NAME reactor_udp COMMAND reactor_udp_test)
@@ -106,4 +117,15 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	target_compile_definitions(reactor_lag_test PRIVATE ASIO_DISABLE_SMALL_BLOCK_RECYCLING)
 	add_test(NAME reactor_lag COMMAND reactor_lag_test)
 	set_tests_properties(reactor_lag PROPERTIES TIMEOUT 60)
+
+	# The tests count live task frames (task::detail::live_frames()); a program's translation
+	# units must all define this alike (task's ODR note), so it is set on every test target.
+	foreach(test_target reactor_accept_pressure_test reactor_test reactor_session_test reactor_udp_test
+			reactor_udp_seam_default_test reactor_udp_seam_header_test reactor_callback_failure_test
+			reactor_events_test reactor_lag_test)
+		target_compile_definitions(${test_target} PRIVATE TASK_COUNT_FRAMES=1)
+	endforeach()
+	if(TARGET reactor_tls_test)
+		target_compile_definitions(reactor_tls_test PRIVATE TASK_COUNT_FRAMES=1)
+	endif()
 endif()

@@ -87,7 +87,7 @@ public:
 	explicit UdpServer(Datagram on_datagram)
 		: socket_(reactor_.io()), on_datagram_(std::move(on_datagram)) {}
 
-	~UdpServer() { stop(); }
+	~UdpServer() { stop(); close(); destroy_roots(); }
 
 	UdpServer(const UdpServer&) = delete;
 	UdpServer& operator=(const UdpServer&) = delete;
@@ -139,7 +139,7 @@ public:
 			group_endpoint_ = udp::endpoint(group, port);
 		}
 
-		asio::co_spawn(reactor_.io(), receive_loop(), asio::detached);
+		task::spawn(task::scheduler_ref::of(reactor_.scheduler()), receive_loop(), [](std::exception_ptr) {});
 		reactor_.claim_loop();
 		try {
 			thread_ = std::thread([this] {
@@ -152,15 +152,18 @@ public:
 		} catch (...) { reactor_.release_loop(); throw; }
 	}
 
-	// Abort tracked work, stop the loop (abandons the pending receive), join -- the same
-	// order as TcpServer::stop(). The socket + io_context are
-	// torn down by the destructor after the thread has joined.
+	// TcpServer's phases (see there), each idempotent. stop(): abort tracked work, stop the loop
+	// (abandons the pending receive) and join. close(): close the scheduler. destroy_roots():
+	// destroy the suspended receive loop. The destructor runs any phase not yet run, then tears
+	// down the socket and io_context.
 	void stop() {
 		if (!thread_.joinable()) { return; }
 		reactor_.abort_all();
 		reactor_.io().stop();
 		thread_.join();
 	}
+	void close() { reactor_.scheduler().close(); }
+	void destroy_roots() { reactor_.scheduler().destroy_roots(); }
 
 	// Send to the configured multicast group (start() must have set a group).
 	std::size_t send(std::string_view data) { return send_to(data, group_endpoint_); }
@@ -202,27 +205,24 @@ private:
 		try { L_EXC("ERROR: UDP reactor callback died with an unhandled exception"); } catch (...) {}
 	}
 
-	asio::awaitable<void> receive_loop() {
+	task::task<void> receive_loop() {
 		std::vector<char> buf(opts_.max_datagram != 0 ? opts_.max_datagram : 1500);
 		asio::ip::udp::endpoint from;
-		try {
-			for (;;) {
-				std::size_t n = co_await socket_.async_receive_from(
-					asio::buffer(buf), from, asio::use_awaitable);
-				if (n != 0 && on_datagram_) {
-					// One bad datagram must not deafen the node: log the throw, keep receiving.
-					try {
-						on_datagram_(std::string_view(buf.data(), n), from);
-					} catch (...) {
-						// A throwing hook must not end the loop either.
-						report_callback_exception();
-					}
+		for (;;) {
+			const auto [error, n] = co_await task::await_asio<void(asio::error_code, std::size_t)>(
+				[&](auto handler) { socket_.async_receive_from(asio::buffer(buf), from, std::move(handler)); });
+			if (error) { co_return; }   // socket closed or cancelled under the running loop, or a failed receive
+			if (n != 0 && on_datagram_) {
+				// One bad datagram must not deafen the node: log the throw, keep receiving.
+				try {
+					on_datagram_(std::string_view(buf.data(), n), from);
+				} catch (...) {
+					// A throwing hook must not end the loop either.
+					report_callback_exception();
 				}
 			}
-		} catch (const std::exception&) {
-			// socket closed or cancelled under the running loop, or a failed receive. stop()
-			// never lands here: the stopped io_context destroys the suspended loop.
 		}
+		// stop() never lands here: destroy_roots() destroys the suspended loop.
 	}
 
 	Reactor reactor_;

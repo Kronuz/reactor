@@ -1,4 +1,5 @@
 #include "reactor.h"
+#include "session_helpers.h"
 #include <fcntl.h>
 #include <csignal>
 #include <iostream>
@@ -69,14 +70,11 @@ unsigned short unused_port() {
 	check(::getsockname(socket.descriptor, reinterpret_cast<sockaddr *>(&endpoint), &size) == 0);
 	return ntohs(endpoint.sin_port);
 }
-asio::awaitable<void> echo(asio::ip::tcp::socket socket, reactor::Reactor &) {
+task::task<void> echo(asio::ip::tcp::socket socket, reactor::Reactor &, reactor::SessionContext) {
 	char byte;
-	asio::error_code error;
-	const auto n = co_await socket.async_read_some(asio::buffer(&byte, 1),
-												   asio::redirect_error(asio::use_awaitable, error));
+	const auto [error, n] = co_await test::read_some(socket, asio::buffer(&byte, 1));
 	if (!error && n)
-		co_await asio::async_write(socket, asio::buffer(&byte, 1),
-								   asio::redirect_error(asio::use_awaitable, error));
+		co_await test::write_all(socket, asio::buffer(&byte, 1));
 }
 std::int64_t cpu() {
 	rusage usage{};
@@ -86,18 +84,21 @@ std::int64_t cpu() {
 }
 void qualify_retry_cancel() {
 	asio::io_context io;
+	task::asio_scheduler scheduler(io.get_executor());
 	auto control = std::make_shared<reactor::detail::AcceptControl>(io);
 	control->retry_delay = std::chrono::milliseconds(1000);
 	const auto began = std::chrono::steady_clock::now();
 	const asio::error_code pressure = asio::error::no_descriptors;
-	auto retry = asio::co_spawn(io, control->retry(pressure), asio::use_future);
+	std::optional<bool> retried;
+	task::spawn(task::scheduler_ref::of(scheduler), control->retry(pressure),
+		[&](std::exception_ptr error, std::optional<bool> value) { check(!error); retried = value; });
 	asio::steady_timer stop(io, std::chrono::milliseconds(10));
 	stop.async_wait([control](const asio::error_code &) {
 		control->stopping.store(true);
 		control->stop_on_owner();
 	});
 	io.run();
-	check(!retry.get());
+	check(retried.has_value() && !*retried);
 	check(std::chrono::steady_clock::now() - began < std::chrono::milliseconds(500));
 }
 void qualify(bool reuse_port) {
@@ -105,9 +106,7 @@ void qualify(bool reuse_port) {
 	Socket first, second;
 	reactor::TcpServer server(
 		2, 0,
-		reactor::TimedSession{[](asio::ip::tcp::socket socket, reactor::Reactor &owner,
-								 reactor::SessionContext) { return echo(std::move(socket), owner); }},
-		8);
+		reactor::Session{echo}, 8);
 	reactor::BindOptions bind;
 	bind.address = "127.0.0.1";
 	bind.reuse_port = reuse_port;

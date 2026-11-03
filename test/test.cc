@@ -18,16 +18,16 @@
 #include <vector>
 
 #include "reactor.h"
+#include "session_helpers.h"
 #include <future>
 
 static int g_fail = 0;
 struct RetirementCounts { std::atomic<unsigned> started{0}, retired{0}, canceled{0}; };
-static asio::awaitable<void> idle_session(asio::ip::tcp::socket socket,
-	std::shared_ptr<RetirementCounts> counts) {
+static task::task<void> idle_session(asio::ip::tcp::socket socket,
+	std::shared_ptr<RetirementCounts> counts, task::cancel_token stop) {
 	++counts->started;
-	char byte = 0; asio::error_code error;
-	co_await socket.async_read_some(asio::buffer(&byte, 1),
-		asio::redirect_error(asio::use_awaitable, error));
+	char byte = 0;
+	const auto [error, n] = co_await test::read_some(socket, asio::buffer(&byte, 1), stop);
 	if (error == asio::error::operation_aborted) { ++counts->canceled; }
 	++counts->retired;
 }
@@ -37,32 +37,25 @@ static void check(bool ok, const std::string& m) {
 }
 
 // ---- a line-echo Session: read a line, reply "echo: <line>\n", keep-alive until EOF ----
-static asio::awaitable<void> echo_session(asio::ip::tcp::socket socket, reactor::Reactor&) {
-	using asio::use_awaitable;
-	try {
-		asio::error_code oe;
-		socket.set_option(asio::ip::tcp::no_delay(true), oe);
-		std::string buf;
-		char tmp[1024];
-		for (;;) {
-			auto nl = buf.find('\n');
-			while (nl == std::string::npos) {
-				std::size_t n = co_await socket.async_read_some(asio::buffer(tmp), use_awaitable);
-				if (n == 0) { co_return; }
-				buf.append(tmp, n);
-				nl = buf.find('\n');
-			}
-			std::string line = buf.substr(0, nl);
-			buf.erase(0, nl + 1);
-
-			std::string reply = "echo: " + line;
-			reply += "\n";
-			co_await asio::async_write(socket, asio::buffer(reply), use_awaitable);
+static task::task<void> echo_session(asio::ip::tcp::socket socket, reactor::Reactor&, reactor::SessionContext context) {
+	asio::error_code oe;
+	socket.set_option(asio::ip::tcp::no_delay(true), oe);
+	std::string buf;
+	char tmp[1024];
+	for (;;) {
+		const auto nl = buf.find('\n');
+		if (nl == std::string::npos) {
+			const auto [error, n] = co_await test::read_some(socket, asio::buffer(tmp), context.stop);
+			if (error || n == 0) { break; }
+			buf.append(tmp, n);
+			continue;
 		}
-	} catch (const std::exception&) {
+		std::string reply = "echo: " + buf.substr(0, nl) + "\n";
+		buf.erase(0, nl + 1);
+		const auto [error, n] = co_await test::write_all(socket, asio::buffer(reply));
+		if (error) { break; }
 	}
-	asio::error_code ec;
-	socket.shutdown(asio::ip::tcp::socket::shutdown_send, ec);
+	socket.shutdown(asio::ip::tcp::socket::shutdown_send, oe);
 }
 
 // ---- tiny blocking client ----
@@ -120,8 +113,8 @@ static void bounded_queued_connections() {
 	// The accepting executor stays available while the other destination is
 	// deliberately stalled. Queued originals must already consume admission.
 	auto counts = std::make_shared<RetirementCounts>();
-	reactor::TcpServer service(2, 0, [counts](asio::ip::tcp::socket socket, reactor::Reactor&) {
-		return idle_session(std::move(socket), counts);
+	reactor::TcpServer service(2, 0, [counts](asio::ip::tcp::socket socket, reactor::Reactor&, reactor::SessionContext context) {
+		return idle_session(std::move(socket), counts, context.stop);
 	});
 	service.set_connection_limit(2);
 	auto observer = service.connection_observer();
@@ -150,8 +143,8 @@ static void bounded_queued_connections() {
 static void bounded_shared_acceptors() {
 	for (bool reuse : {false, true}) {
 		auto counts = std::make_shared<RetirementCounts>();
-		reactor::TcpServer service(4, 0, [counts](asio::ip::tcp::socket socket, reactor::Reactor&) {
-			return idle_session(std::move(socket), counts);
+		reactor::TcpServer service(4, 0, [counts](asio::ip::tcp::socket socket, reactor::Reactor&, reactor::SessionContext context) {
+			return idle_session(std::move(socket), counts, context.stop);
 		});
 		service.set_connection_limit(3);
 		reactor::BindOptions bind; bind.address = "127.0.0.1"; bind.reuse_port = reuse; service.set_bind_options(bind);
@@ -200,11 +193,10 @@ static void run_marker() {
 	check(!reactor::inside_run(), "[M] RunScope restores on exit");
 
 	std::atomic<int> session_loop{-1};
-	reactor::Session probe = [&](asio::ip::tcp::socket socket, reactor::Reactor&) -> asio::awaitable<void> {
+	reactor::Session probe = [&](asio::ip::tcp::socket socket, reactor::Reactor&, reactor::SessionContext) -> task::task<void> {
 		session_loop = reactor::inside_run();
 		std::string reply = "done\n";
-		asio::error_code ec;
-		co_await asio::async_write(socket, asio::buffer(reply), asio::redirect_error(asio::use_awaitable, ec));
+		co_await test::write_all(socket, asio::buffer(reply));
 	};
 	unsigned short port = free_port();
 	reactor::TcpServer svc(1, 8, probe);
@@ -332,12 +324,11 @@ static void force_after_grace() {
 		}
 	};
 	Shared shared;
-	reactor::Session session = [&shared](asio::ip::tcp::socket socket, reactor::Reactor& r) -> asio::awaitable<void> {
+	reactor::Session session = [&shared](asio::ip::tcp::socket socket, reactor::Reactor& r, reactor::SessionContext) -> task::task<void> {
 		Stubborn stub(shared, socket);
 		r.track(stub); ++shared.started;
-		co_await asio::this_coro::reset_cancellation_state(asio::disable_cancellation());   // like a request mid-write
-		char byte; asio::error_code ec;
-		co_await socket.async_read_some(asio::buffer(&byte, 1), asio::redirect_error(asio::use_awaitable, ec));
+		char byte;   // ignores the stop token, like a request mid-write
+		co_await test::read_some(socket, asio::buffer(&byte, 1));
 		r.untrack(stub);
 	};
 	reactor::TcpServer svc(1, 8, session);
@@ -436,11 +427,10 @@ int main() {
 		};
 		std::atomic<bool> aborted{false};
 		unsigned short port = free_port();
-		reactor::Session waiting = [&aborted](asio::ip::tcp::socket, reactor::Reactor& r) -> asio::awaitable<void> {
+		reactor::Session waiting = [&aborted](asio::ip::tcp::socket, reactor::Reactor& r, reactor::SessionContext) -> task::task<void> {
 			Wait wait(r.io(), aborted);
 			r.track(wait);
-			asio::error_code ec;
-			co_await wait.timer.async_wait(asio::redirect_error(asio::use_awaitable, ec));
+			co_await test::wait_timer(wait.timer);
 			r.untrack(wait);
 		};
 		auto* svc = new reactor::TcpServer(1, 64, waiting);
@@ -510,8 +500,8 @@ int main() {
 	for (auto reactors : {1u, 4u}) {
 		auto counts = std::make_shared<RetirementCounts>();
 		reactor::TcpServer service(reactors, 0,
-			[counts](asio::ip::tcp::socket socket, reactor::Reactor&) {
-				return idle_session(std::move(socket), counts);
+			[counts](asio::ip::tcp::socket socket, reactor::Reactor&, reactor::SessionContext context) {
+				return idle_session(std::move(socket), counts, context.stop);
 			});
 		auto port = free_port(); service.start(port); wait_listen(port);
 		std::vector<int> clients;

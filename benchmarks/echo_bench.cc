@@ -30,15 +30,16 @@
 
 using Clock = std::chrono::steady_clock;
 
-static asio::awaitable<void> echo(asio::ip::tcp::socket socket, reactor::Reactor&) {
+static task::task<void> echo(asio::ip::tcp::socket socket, reactor::Reactor&, reactor::SessionContext context) {
 	char buf[256];
-	try {
-		for (;;) {
-			std::size_t n = co_await socket.async_read_some(asio::buffer(buf), asio::use_awaitable);
-			if (n == 0) { break; }
-			co_await asio::async_write(socket, asio::buffer(buf, n), asio::use_awaitable);
-		}
-	} catch (const std::exception&) {}
+	for (;;) {
+		const auto [error, n] = co_await task::await_asio<void(asio::error_code, std::size_t)>(
+			[&](auto handler) { socket.async_read_some(asio::buffer(buf), std::move(handler)); }, context.stop);
+		if (error || n == 0) { break; }
+		const auto [write_error, written] = co_await task::await_asio<void(asio::error_code, std::size_t)>(
+			[&](auto handler) { asio::async_write(socket, asio::buffer(buf, n), std::move(handler)); });
+		if (write_error) { break; }
+	}
 	asio::error_code ec;
 	socket.shutdown(asio::ip::tcp::socket::shutdown_send, ec);
 }
