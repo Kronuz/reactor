@@ -5,7 +5,7 @@
 - Design: http `docs/design/task-handlers.md` (branch `design/task-handlers`), "Decisions: reactor (step R)" R1-R4 and the gate rows that name step R (T1, T2, T3, T4 (i), T5, K1, K2, K4, K5, K9); review `docs/reviews/task-handlers-rev2-design.md` (TH2-R1, TH2-R3, TH2-R7); Detent `docs/SHARED_LIBRARY_DECISIONS.md`, "task cancellation, inline resume and reactor sessions"; the W2 D15 ruling (below).
 - Branch / worktree: `phase/task-sessions` at `~/code/Kronuz/reactor-wt/task-sessions`, from reactor `origin/main` ade618d.
 - task pin: `CMakeLists.txt`, the one `FetchContent_Declare(task ...)` line, task:cbfee34 (`phase/cancellation-c2`); moves to step C3's commit.
-- State: built; CI green at reactor:HEADSHA (see Log)
+- State: built; CI green at reactor:784f558 (run 41575062749) (see Log)
 
 ## Done criteria (from the design's gate rows naming step R; tick only with evidence)
 
@@ -78,7 +78,7 @@ Reactor's header now includes `task.hh` and `task_asio.hh`, so every consumer ne
 
 ## Log
 
-- 2026-11-02: worktree and branch from `origin/main` ade618d. reactor:bc580b5 the sessions, accept loops and UDP loop as tasks; reactor:6b8b83e the alloc test; reactor:2dd6ec6 docs and this ledger; reactor:ca6ac5b the pin at task:d3d94f3 and the `close()` assertions; reactor:HEAD_FIX the accept-backlog fix and its test; reactor:HEAD_ALLOC the macOS bound for the alloc test. Pushed.
+- 2026-11-02: worktree and branch from `origin/main` ade618d. reactor:bc580b5 the sessions, accept loops and UDP loop as tasks; reactor:6b8b83e the alloc test; reactor:2dd6ec6 docs and this ledger; reactor:ca6ac5b the pin at task:d3d94f3 and the `close()` assertions; reactor:ba665e6 the accept-backlog fix and its test; reactor:784f558 the macOS bound for the alloc test. Pushed.
 - Per the W2 D15 ruling (the lead, via Detent's W2 re-check): `TcpServer` and `UdpServer` expose the phases as separate calls (`stop()`, `close()`, `destroy_roots()`), the destructor runs any phase not yet run, and `session_test` [X] drives them one by one with an external scheduler's roots interleaved, with a mutant (`close()` and `destroy_roots()` no-ops both die).
-- CI run 41567766764 (first push): every Linux job, FreeBSD, linux-tsan green; macos-arm64 and macos-x86_64 failed (`reactor` timeout, rerun failed the same): the accept-backlog hang, open question 6. Run 41573979883 (with the fix): macos-arm64, macos-x86_64, linux-x86_64-gcc, linux-x86_64-clang, linux-arm64-gcc, linux-asan-ubsan, linux-tsan, freebsd-x86_64 all success; the `headers` job is skipped (not enabled in reactor's workflow).
+- CI run 41575062749 at reactor:784f558: every job success (headers skipped). CI run 41567766764 (first push): every Linux job, FreeBSD, linux-tsan green; macos-arm64 and macos-x86_64 failed (`reactor` timeout, rerun failed the same): the accept-backlog hang, open question 6. Run 41573979883 (with the fix): macos-arm64, macos-x86_64, linux-x86_64-gcc, linux-x86_64-clang, linux-arm64-gcc, linux-asan-ubsan, linux-tsan, freebsd-x86_64 all success; the `headers` job is skipped (not enabled in reactor's workflow).
 - The Linux box lease ended partway; the rest ran locally (macOS Apple clang Debug and RelWithDebInfo, `quiet light`).
