@@ -85,6 +85,13 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	add_test(NAME reactor_session COMMAND reactor_session_test)
 	set_tests_properties(reactor_session PROPERTIES TIMEOUT 60)
 
+	# Allocations per accepted connection against head's count (operator new is replaced in it).
+	add_executable(reactor_alloc_test test/alloc_test.cc)
+	target_link_libraries(reactor_alloc_test PRIVATE reactor)
+	target_compile_definitions(reactor_alloc_test PRIVATE ASIO_DISABLE_SMALL_BLOCK_RECYCLING)
+	add_test(NAME reactor_alloc COMMAND reactor_alloc_test)
+	set_tests_properties(reactor_alloc PROPERTIES TIMEOUT 120)
+
 	add_executable(reactor_udp_test test/udp_test.cc)
 	target_link_libraries(reactor_udp_test PRIVATE reactor)
 	add_test(NAME reactor_udp COMMAND reactor_udp_test)
@@ -120,7 +127,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 
 	# The tests count live task frames (task::detail::live_frames()); a program's translation
 	# units must all define this alike (task's ODR note), so it is set on every test target.
-	foreach(test_target reactor_accept_pressure_test reactor_test reactor_session_test reactor_udp_test
+	foreach(test_target reactor_accept_pressure_test reactor_test reactor_session_test reactor_alloc_test reactor_udp_test
 			reactor_udp_seam_default_test reactor_udp_seam_header_test reactor_callback_failure_test
 			reactor_events_test reactor_lag_test)
 		target_compile_definitions(${test_target} PRIVATE TASK_COUNT_FRAMES=1)

@@ -1,6 +1,6 @@
-// alloc_test -- heap allocations per accepted connection (operator new calls, with Asio's block
-// recycling off so its handler allocations count too). The bound is the count at the commit
-// before the Session moved to task (reactor:ade618d), measured by the same program there.
+// alloc_test -- heap allocations per accepted connection: operator new calls plus the aligned_alloc
+// behind Asio's per-thread cache, with Asio's handler recycling off. The bound is the count at the
+// commit before the Session moved to task (reactor:ade618d), by the same program there.
 
 #include <atomic>
 #include <cstdio>
@@ -11,6 +11,18 @@
 #include "reactor.h"
 #include "session_helpers.h"
 
+// TSan's runtime defines operator new itself; the count does not depend on the sanitizer.
+#if defined(__SANITIZE_THREAD__)
+#  define ALLOC_TEST_SKIP 1
+#elif defined(__has_feature)
+#  if __has_feature(thread_sanitizer)
+#    define ALLOC_TEST_SKIP 1
+#  endif
+#endif
+#ifdef ALLOC_TEST_SKIP
+int main() { std::printf("skipped under ThreadSanitizer\n"); return 0; }
+#else
+
 static std::atomic<unsigned long> g_news{0};
 void* operator new(std::size_t size) {
 	g_news.fetch_add(1, std::memory_order_relaxed);
@@ -19,8 +31,16 @@ void* operator new(std::size_t size) {
 }
 void* operator new(std::size_t size, std::align_val_t alignment) {
 	g_news.fetch_add(1, std::memory_order_relaxed);
-	if (void* p = std::aligned_alloc(static_cast<std::size_t>(alignment), (size + static_cast<std::size_t>(alignment) - 1) & ~(static_cast<std::size_t>(alignment) - 1))) { return p; }
+	void* p = nullptr;
+	if (::posix_memalign(&p, static_cast<std::size_t>(alignment), size ? size : 1) == 0) { return p; }
 	throw std::bad_alloc();
+}
+// Asio's per-thread handler cache refills through std::aligned_alloc; count those too.
+extern "C" void* aligned_alloc(std::size_t alignment, std::size_t size) {
+	g_news.fetch_add(1, std::memory_order_relaxed);
+	void* p = nullptr;
+	if (::posix_memalign(&p, alignment < sizeof(void*) ? sizeof(void*) : alignment, size ? size : 1) != 0) { return nullptr; }
+	return p;
 }
 void operator delete(void* p) noexcept { std::free(p); }
 void operator delete(void* p, std::size_t) noexcept { std::free(p); }
@@ -57,18 +77,27 @@ static double per_connection(std::size_t reactors, bool reuse_port) {
 
 int main() {
 	struct Case { const char* name; std::size_t reactors; bool reuse_port; double head; };
-	// head: reactor:ade618d, the same program with the awaitable Session.
+	// head: reactor:ade618d, the same program with the awaitable Session (Linux x86-64, clang 18);
+	// a negative bound only reports.
+#if defined(__linux__)
+	const double head_one = 9.0, head_shared = 7.5;
+#elif defined(__APPLE__)
+	const double head_one = -1, head_shared = -1;
+#else
+	const double head_one = -1, head_shared = -1;
+#endif
 	const Case cases[] = {
-		{"1 reactor, own acceptor", 1, true, HEAD_ONE},
-		{"2 reactors, shared acceptor", 2, false, HEAD_SHARED},
+		{"1 reactor, own acceptor", 1, true, head_one},
+		{"2 reactors, shared acceptor", 2, false, head_shared},
 	};
 	for (const auto& c : cases) {
 		const double got = per_connection(c.reactors, c.reuse_port);
 		std::printf("  %s: %.2f allocations per accepted connection (head %.2f)\n", c.name, got, c.head);
-		const bool ok = got >= 0 && got <= c.head;
+		const bool ok = got >= 0 && (c.head < 0 || got <= c.head);
 		std::printf("  %s %s: no more allocations per connection than head\n", ok ? "ok:  " : "FAIL:", c.name);
 		if (!ok) { ++g_fail; }
 	}
 	std::printf("\n%s (%d failures)\n", g_fail == 0 ? "PASS" : "FAIL", g_fail);
 	return g_fail == 0 ? 0 : 1;
 }
+#endif
