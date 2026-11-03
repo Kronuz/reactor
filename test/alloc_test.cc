@@ -83,12 +83,19 @@ static double per_connection(std::size_t reactors, bool reuse_port, bool echo) {
 }
 
 int main() {
-	struct Case { const char* name; std::size_t reactors; bool reuse_port; bool echo; double head; };
+	struct Case { const char* name; std::size_t reactors; bool reuse_port; bool echo; double head, pinned; };
 	// head: reactor:ade618d, the same sessions as asio::awaitable (alloc_head.cc; the echo is the step R
 	// review's probe_alloc_echo). The trivial counts are the same on Linux x86-64 (clang 18) and macOS
-	// x86-64; the echo counts were measured on macOS only. A negative bound only reports.
+	// x86-64; the echo counts were measured on macOS only. `pinned` is this commit's count on macOS
+	// (task:6558c2e), so a change that adds an allocation per connection fails here until it is
+	// measured and the pin raised. A negative bound only reports.
 #ifdef ASIO_DISABLE_SMALL_BLOCK_RECYCLING
 	const char* mode = "Asio recycling off";
+#  if defined(__APPLE__)
+	const double pinned[] = {3.0, 3.5, 5.0, 5.5};
+#  else
+	const double pinned[] = {-1, -1, -1, -1};
+#  endif
 #  if defined(__linux__) || defined(__APPLE__)
 	const double trivial_one = 9.0, trivial_shared = 7.5;
 #  else
@@ -102,6 +109,11 @@ int main() {
 #else
 	const char* mode = "Asio recycling on";
 #  if defined(__APPLE__)
+	const double pinned[] = {0.0, 1.0, 0.0, 1.5};
+#  else
+	const double pinned[] = {-1, -1, -1, -1};
+#  endif
+#  if defined(__APPLE__)
 	const double trivial_one = 3.0, trivial_shared = 2.0, echo_one = 6.0, echo_shared = 6.0;
 #  else
 	const double trivial_one = -1, trivial_shared = -1, echo_one = -1, echo_shared = -1;
@@ -109,17 +121,19 @@ int main() {
 #endif
 	std::printf("== allocations per accepted connection, %s ==\n", mode);
 	const Case cases[] = {
-		{"1 reactor, own acceptor, trivial session", 1, true, false, trivial_one},
-		{"2 reactors, shared acceptor, trivial session", 2, false, false, trivial_shared},
-		{"1 reactor, own acceptor, echo session", 1, true, true, echo_one},
-		{"2 reactors, shared acceptor, echo session", 2, false, true, echo_shared},
+		{"1 reactor, own acceptor, trivial session", 1, true, false, trivial_one, pinned[0]},
+		{"2 reactors, shared acceptor, trivial session", 2, false, false, trivial_shared, pinned[1]},
+		{"1 reactor, own acceptor, echo session", 1, true, true, echo_one, pinned[2]},
+		{"2 reactors, shared acceptor, echo session", 2, false, true, echo_shared, pinned[3]},
 	};
 	for (const auto& c : cases) {
 		const double got = per_connection(c.reactors, c.reuse_port, c.echo);
-		std::printf("  %s: %.2f allocations per accepted connection (head %.2f)\n", c.name, got, c.head);
+		std::printf("  %s: %.2f allocations per accepted connection (head %.2f, pinned %.2f)\n", c.name, got, c.head, c.pinned);
 		const bool ok = got >= 0 && (c.head < 0 || got <= c.head);
 		std::printf("  %s %s: no more allocations per connection than head\n", ok ? "ok:  " : "FAIL:", c.name);
-		if (!ok) { ++g_fail; }
+		const bool held = got >= 0 && (c.pinned < 0 || got <= c.pinned);
+		std::printf("  %s %s: no more than the pinned count\n", held ? "ok:  " : "FAIL:", c.name);
+		if (!ok || !held) { ++g_fail; }
 	}
 	std::printf("\n%s (%d failures)\n", g_fail == 0 ? "PASS" : "FAIL", g_fail);
 	return g_fail == 0 ? 0 : 1;
