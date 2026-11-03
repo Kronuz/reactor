@@ -140,3 +140,6 @@ Observation (not a finding of this round, not fixed): a session that moves itsel
 - The same probes, ASan+UBSan: tokenless read 210 ms, write 344 ms (grace 200 ms), token 0 ms; close-first and roots-first 4 of 4; udp-close-first frames +0; cross-session-ab 0 ms; cross-session-ba 416 ms; storm 0 hung, 0 leaked; cbfail_race 103-109 ms three times; dtor-ab use-after-poison and dtor-ba heap-use-after-free, as the review saw (CR12, the documented no-phases hazard).
 - Linux allocation counts at reactor:4c861f0 (the AWS lease, Ubuntu clang 18.1.3, RelWithDebInfo): the task C3 Linux column above.
 - CI run 41586745829 at reactor:5801ae8 (task C3 pin, the whole fix round): freebsd-x86_64, linux-x86_64-gcc, linux-arm64-gcc, linux-x86_64-clang, linux-asan-ubsan, linux-tsan, macos-arm64, macos-x86_64 success; headers skipped. Build dirs and the task C3 worktree deleted; `.scratch/review-r/bin` kept.
+
+## Follow-up (lead, 2026-11-03)
+- F1: a session ending on another server's loop untracks its control from that thread while its own reactor's `AbortList` walk (`force_all()`/`abort_all()`) may run unlocked on the session's loop (ledger :113; re-check note). TSan clean, no test drives the overlap. Before the consumer wave lands: a test that drives the overlap, then a lock or a hop of the untrack onto the owning loop.
