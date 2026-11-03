@@ -56,7 +56,7 @@ task::task<void> echo(asio::ip::tcp::socket socket, reactor::Reactor&, reactor::
 
 int main() {
 	reactor::TcpServer server(/*reactors*/ 4, /*in flight per reactor*/ 256, echo);
-	server.start(8080);  // binds, listens, and returns once every acceptor is ready
+	server.start(8080);  // binds, listens, and returns once every acceptor is ready; start(0) + server.port() picks a free port
 	std::getchar();      // meanwhile, a client on port 8080 gets its bytes back
 	server.stop();       // call from outside the reactors
 }

@@ -6,6 +6,19 @@ entries are dated.
 
 Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://github.com/Kronuz/cpp-libraries/blob/main/docs/UPGRADING-2026-10.md#reactor) lists what changes for callers, how to find affected inputs, the commits not to pin, and the speedup.
 
+## 2026-11-03
+
+### Added
+
+- `TcpServer::port()` returns the port every listener is bound to, read from the acceptor's
+  `local_endpoint()` after bind, so `start(0)` can report the port the OS chose. Valid after
+  `start()` returns, until `stop()`.
+
+### Fixed
+
+- `start(0)` with `reuse_port` and more than one reactor bound each reactor to a different
+  ephemeral port. The first listener now binds and the others bind the port it got.
+
 ## 2026-11-02
 
 ### Changed

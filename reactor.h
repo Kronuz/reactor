@@ -531,8 +531,8 @@ inline task::task<void> accept_loop(Reactor* reactor, const Session* session,
 	if (bind.reuse_port) { acceptor.set_option(reuse_port_option(true)); }
 	acceptor.bind(ep);
 	acceptor.listen(bind.backlog);
-	control->listening();
 	control->bound = acceptor.local_endpoint();
+	control->listening();
 	tcp::endpoint peer;
 	while (!control->stopping.load()) {
 		tcp::socket socket(reactor->io());
@@ -570,8 +570,8 @@ inline task::task<void> shared_accept_loop(std::vector<Reactor*> reactors, const
 	acceptor.set_option(tcp::acceptor::reuse_address(true));
 	acceptor.bind(ep);
 	acceptor.listen(bind.backlog);
-	control->listening();
 	control->bound = acceptor.local_endpoint();
+	control->listening();
 	tcp::endpoint peer;
 	std::size_t next = 0;
 	while (!control->stopping.load()) {
@@ -640,6 +640,9 @@ public:
 	void set_shutdown_grace(std::chrono::milliseconds grace) { grace_ = grace; }
 
 	std::size_t reactors() const { return n_; }
+	// The one port every listener is bound to, as the OS reports it (the answer for start(0)).
+	// Valid after start() returns, until stop(); 0 before start().
+	unsigned short port() const noexcept { return port_; }
 	Reactor& reactor(std::size_t i) { return *reactors_[i]; }
 	// Run a LagProbe on every reactor from start() on; set before start(). Off by default.
 	void enable_lag_probe() {
@@ -680,9 +683,12 @@ public:
 				accepts_.push_back(control);
 				try { task::spawn(task::scheduler_ref::of(r->scheduler()), detail::accept_loop(r.get(), &session_, port, bind_, control, admission_),
 					[control](std::exception_ptr error) { control->finish(error); }); } catch (...) { control->finish(); throw; }
+				// Port 0: the first listener's port is the one the others bind.
+				if (port == 0) { accepts_.front()->wait_listening(); port = accepts_.front()->bound.port(); }
 			}
 		}
 		for (auto& control : accepts_) { control->wait_listening(); }
+		port_ = accepts_.front()->bound.port();
 		} catch (...) {
 			for (auto& control : accepts_) { control->stopping.store(true); }
 			// Unstarted contexts cannot have admitted sessions. Drain any queued
@@ -743,6 +749,7 @@ private:
 	}
 
 	bool started_ = false, stopped_ = false;
+	unsigned short port_ = 0;
 	bool lag_probe_ = false;
 	std::vector<std::shared_ptr<detail::AcceptControl>> accepts_;
 	std::size_t n_;

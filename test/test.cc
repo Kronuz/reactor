@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -405,6 +406,29 @@ static void accept_survives_reset() {
 	}
 }
 
+// port(): start(0) reports the OS-assigned port, one for every listener, and it serves.
+static void bound_port() {
+	for (const bool reuse : {false, true}) {
+		std::mutex mutex;
+		std::set<const reactor::Reactor*> seen;
+		reactor::TcpServer svc(4, 64, [&](asio::ip::tcp::socket socket, reactor::Reactor& r, reactor::SessionContext context) -> task::task<void> {
+			{ std::lock_guard lock(mutex); seen.insert(&r); }
+			return echo_session(std::move(socket), r, std::move(context));
+		});
+		reactor::BindOptions b; b.address = "127.0.0.1"; b.reuse_port = reuse; svc.set_bind_options(b);
+		check(svc.port() == 0, "[P] port() is 0 before start");
+		svc.start(0);
+		const auto port = svc.port();
+		check(port != 0, reuse ? "[P] reuse_port: start(0) reports a port" : "[P] shared: start(0) reports a port");
+		int ok = serve_count(port, 64);
+		check(ok == 64, "[P] every connection to port() is served");
+#ifdef __linux__
+		// The kernel balances SO_REUSEPORT listeners only when all share the port.
+		if (reuse) { std::lock_guard lock(mutex); check(seen.size() > 1, "[P] reuse_port: connections reach several reactors"); }
+#endif
+	}
+}
+
 int main() {
 	std::setvbuf(stdout, nullptr, _IOLBF, 0);   // a hung run still shows how far it got
 	std::printf("== reactor runtime test ==\n");
@@ -537,7 +561,7 @@ int main() {
 			"stop reaps original idle reads and session callbacks before returning");
 		for (auto fd : clients) { if (fd >= 0) ::close(fd); }
 	}
-	bounded_queued_connections(); bounded_shared_acceptors(); run_marker(); admission_gate(); abort_list(); abort_on_loop(); force_after_grace(); accept_survives_reset();
+	bounded_queued_connections(); bounded_shared_acceptors(); run_marker(); admission_gate(); abort_list(); abort_on_loop(); force_after_grace(); accept_survives_reset(); bound_port();
 	std::printf("\n%s (%d failures)\n", g_fail == 0 ? "PASS" : "FAIL", g_fail);
 	return g_fail == 0 ? 0 : 1;
 }

@@ -25,6 +25,11 @@ still waiting on anything else after twice the grace stays suspended until `dest
 destroys it. `stop()` never waits longer than that. An exception that escapes the session
 (including `task::cancelled`) ends the connection and is dropped.
 
+`start(port)` returns once every listener is bound; `port()` is the one port they share, as the OS
+reports it, so `start(0)` picks a free port and `port()` names it. With `reuse_port` and several
+reactors, the first listener binds and the others bind the port it got. `port()` is valid after
+`start()` returns until `stop()`, and 0 before `start()`.
+
 Each `Reactor` owns one `task::asio_scheduler`, `reactor(i).scheduler()`, for its loop. The
 session, the accept loops and `UdpServer`'s receive loop are tasks spawned on it, and a host may
 spawn its own there. Link `task::asio` (the CMake target `reactor` does).
