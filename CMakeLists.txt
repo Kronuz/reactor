@@ -31,9 +31,9 @@ if(ASIO_INCLUDE_DIR STREQUAL "")
 endif()
 
 # --- task (cancellable coroutines; the Session type and the loops' scheduler) ---
-# The one place the pin lives: task main after step C2 (task:d3d94f3), to move to step C3's commit.
+# The one place the pin lives: task main after step C3 (task:6558c2e, inline resume of top-level completions).
 # Set FETCHCONTENT_SOURCE_DIR_TASK to build against a local checkout instead.
-FetchContent_Declare(task GIT_REPOSITORY https://github.com/Kronuz/task.git GIT_TAG d3d94f31e62688bcdd51f8110ee08ed74f53fc81)
+FetchContent_Declare(task GIT_REPOSITORY https://github.com/Kronuz/task.git GIT_TAG 6558c2e9c533ebb0fa1177f22edd4fff528f6efa)
 FetchContent_MakeAvailable(task)
 
 # --- the reactor runtime (header-only) ---
