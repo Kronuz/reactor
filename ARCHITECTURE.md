@@ -159,7 +159,7 @@ after it, because an Abortable's owner lives on that loop; a host that drives a 
 on its own thread brackets the thread with `claim_loop()`/`release_loop()` so the walk
 is posted rather than run on the caller; when the loop's last thread leaves `run()` before the
 posted walk runs, the caller runs it. `abort()` may run `untrack` on any node. Tracking after the abort walk aborts at once, and after
-the force walk forces at once, so a request that starts late in shutdown cannot wait on a peer forever. The destructor calls `stop()`, so a `TcpServer`
+the force walk forces at once, so a request that starts late in shutdown cannot wait on a peer forever. The destructor calls `destroy_roots()`, which runs `stop()` and `close()` first if they have not run, so a `TcpServer`
 going out of scope tears down cleanly on its own.
 
 ## UDP: the connectionless path (`reactor_udp.h`)
