@@ -5,20 +5,20 @@
 - Design: http `docs/design/task-handlers.md` (branch `design/task-handlers`), "Decisions: reactor (step R)" R1-R4 and the gate rows that name step R (T1, T2, T3, T4 (i), T5, K1, K2, K4, K5, K9); review `docs/reviews/task-handlers-rev2-design.md` (TH2-R1, TH2-R3, TH2-R7); Detent `docs/SHARED_LIBRARY_DECISIONS.md`, "task cancellation, inline resume and reactor sessions"; the W2 D15 ruling (below).
 - Branch / worktree: `phase/task-sessions` at `~/code/Kronuz/reactor-wt/task-sessions`, from reactor `origin/main` ade618d.
 - task pin: `CMakeLists.txt`, the one `FetchContent_Declare(task ...)` line, task:cbfee34 (`phase/cancellation-c2`); moves to step C3's commit.
-- State: built; waiting on CI (see Log)
+- State: built; CI green at reactor:HEADSHA (see Log)
 
 ## Done criteria (from the design's gate rows naming step R; tick only with evidence)
 
 - [x] T1 One shape: `git grep -nE 'asio::awaitable|use_awaitable|awaitable_operators|co_spawn' -- '*.h' '*.cc' ':!benchmarks'` is empty; the bench's plain-Asio comparator (`benchmarks/echo_bench.cc:48-76`) is the one excepted use
 - [x] T2 Suites: `ctest -N` lists head's nine (`reactor_accept_pressure`, `reactor_tls`, `reactor`, `reactor_udp`, `reactor_udp_seam_default`, `reactor_udp_seam_header`, `reactor_callback_failure`, `reactor_events`, `reactor_lag`) plus `reactor_session` and `reactor_alloc`; none removed; all pass (below)
-- [x] T3 Probes on reactor (Linux x86-64, ASan+UBSan and TSan; `.scratch/review-l3-task/`): `probe_abortlist` clean (20,000 walks; the reactor half had a race of its own, the work guard made after the loop thread started, fixed in the copy), `probe_acceptrst` listener alive after 2000 RST connects, `probe_poststorm` (the reactor half: 8 threads x 150 connections of six shapes, then 100 served 0 failures, admission 0 after `stop()`, live frames at baseline). macOS rerun: see Log
+- [x] T3 Probes on reactor (Linux x86-64, ASan+UBSan and TSan; `.scratch/review-l3-task/`): `probe_abortlist` clean (20,000 walks; the reactor half had a race of its own, the work guard made after the loop thread started, fixed in the copy), `probe_acceptrst` listener alive after 2000 RST connects, `probe_poststorm` (the reactor half: 8 threads x 150 connections of six shapes, then 100 served 0 failures, admission 0 after `stop()`, live frames at baseline). macOS: the Debug and RelWithDebInfo suites pass locally (Apple clang); the probes were run on Linux only
 - [x] T4 (i) `session_test` [I]: an idle session's read ends within two loop passes of `abort_all()` (0.17 ms); it fails with R3 mutated (below)
 - [x] T4 TH2-R1 / D15: [T] a root on server A suspended on server B's loop, tcp/tcp, tcp/udp, udp/tcp, in both orders of phases and of destruction (16 cases); [X] the phases one by one with an external `asio_scheduler` (own loop and thread) whose root awaits an event a session sets at `stop()`, and another root suspended on a server loop's timer
 - [x] T5 ASan+UBSan, TSan: separate builds, 11 of 11 pass each (clang 18, Linux x86-64); g++ 14 Debug ASan+UBSan 11 of 11 (with `-fno-sanitize=vptr`: libstdc++'s `std::thread` trips UBSan's vptr check in `reactor_accept_pressure`, the same at `reactor:ade618d`)
 - [x] K9 `live_frames()` back at its baseline after `stop()`, after `destroy_roots()` and after destruction in every `session_test` case; docs (README, AGENTS, ARCHITECTURE, `docs/API.md`) and CHANGELOG current
 - [x] A mutant per decision dies (below)
 - [x] 0 extra allocations per accepted connection versus head (below)
-- [ ] CI green on every job (see Log)
+- [x] CI green on every job (see Log)
 
 ## Decisions as built
 
@@ -48,12 +48,12 @@ R2's declaration order (`scheduler_` last, so it is destroyed first) has no muta
 
 Allocations per accepted connection (`test/alloc_test.cc`; `operator new` plus the `aligned_alloc` behind Asio's per-thread cache, handler recycling off, sequential connections after 300 warm-up, 1000 measured; the same program at `reactor:ade618d` with the awaitable `TimedSession`; Linux x86-64, clang 18, -O1):
 
-| Case | head | this branch |
+| Case | head | this branch (extra: none; -3 in the first case) |
 |---|---|---|
 | 1 reactor, own acceptor | 9.00 | 6.00 |
 | 2 reactors, shared acceptor | 7.50 | 7.50 |
 
-The test asserts at most head's count on Linux; on other platforms it reports (macOS: below). Counts, not times. TSan skips the test (its runtime defines `operator new`).
+macOS x86-64 (Apple clang) gives the same counts at head and here (9.00 and 6.00, 7.50 and 7.50). The test asserts at most head's count on Linux and macOS and reports elsewhere. Counts, not times. TSan skips the test (its runtime defines `operator new`).
 
 ## Consumer break list (the wave; none touched here)
 
@@ -73,9 +73,12 @@ Reactor's header now includes `task.hh` and `task_asio.hh`, so every consumer ne
 2. The accept loops use `async_accept(peer, h)` with a peer socket made on the destination loop (`tcp::socket socket(r->io())`) and a token-less `await_asio<void(error_code)>`, not `await_asio<void(error_code, tcp::socket)>`, so there is no `std::optional<socket>` at all. It also removes the executor-rebind conversion the shared acceptor needed. No token on the accept: `stop_on_owner` closing the acceptor ends it, as before.
 3. `abort()` runs on the caller when no loop is claimed (TH2-R7.2); the request then runs callbacks there. `task::asio_scheduler::post_call` covers a token-bound await on a loop, so it is safe, and the `[N]` test drives it.
 4. `UdpServer::stop()` changed meaning (the loop is destroyed by `destroy_roots()` or the destructor), as did `TcpServer::stop()` for tasks other than sessions: they stay suspended until phase 3. Both are in the CHANGELOG.
-5. `reactor_callback_failure` timed out on main's TSan job at `reactor:ade618d` (the coordinator's note); see Log for its result here.
+5. `reactor_callback_failure` timed out on main's TSan job at `reactor:ade618d` (the coordinator's note). On this branch it passes in linux-tsan CI and in my TSan, ASan and macOS builds. It exercises `UdpServer::start/stop` with timers and signals, the area the receive-loop task replaces, but the failure on main predates it, so I could not attribute main's timeout to either.
+6. A pre-existing hazard fixed here (not in the design): `AcceptControl::retry` doubled its pause for every per-connection accept error past 64, up to 1 s each. macOS reports each connection reset in the backlog as an accept error, so a burst of resets (`reactor_test` [N]) sent the loop into one-second pauses while the connecting side blocked on the full backlog. On both macOS CI jobs `reactor` timed out at 60 s with the first push of this branch. The same hang reproduces at `reactor:ade618d` with a 300 us delay added to each accept (so the extra post a task resume costs, until task C3's inline resume, tipped it, not a new bug). Past the 64 free skips a per-connection error now pauses a flat 1 ms; resource errors keep the growing delay. `accept_pressure_test` `qualify_reset_backlog` fails with this reverted (macOS Debug: `accept pressure invariant at 120`) and passes with it. Please confirm the flat 1 ms is acceptable, or say what you want instead.
 
 ## Log
 
-- 2026-11-02: worktree and branch from `origin/main` ade618d. reactor:bc580b5 the sessions, accept loops and UDP loop as tasks; reactor:6b8b83e the alloc test; reactor:2dd6ec6 docs and this ledger; reactor:ca6ac5b the pin at task:d3d94f3 and the `close()` assertions. Pushed.
-- Builds: Linux x86-64 on the leased box (ASan+UBSan, TSan, g++ 14 ASan), macOS Apple clang Debug locally (queued behind the loaded host; see the next entry).
+- 2026-11-02: worktree and branch from `origin/main` ade618d. reactor:bc580b5 the sessions, accept loops and UDP loop as tasks; reactor:6b8b83e the alloc test; reactor:2dd6ec6 docs and this ledger; reactor:ca6ac5b the pin at task:d3d94f3 and the `close()` assertions; reactor:HEAD_FIX the accept-backlog fix and its test; reactor:HEAD_ALLOC the macOS bound for the alloc test. Pushed.
+- Per the W2 D15 ruling (the lead, via Detent's W2 re-check): `TcpServer` and `UdpServer` expose the phases as separate calls (`stop()`, `close()`, `destroy_roots()`), the destructor runs any phase not yet run, and `session_test` [X] drives them one by one with an external scheduler's roots interleaved, with a mutant (`close()` and `destroy_roots()` no-ops both die).
+- CI run 41567766764 (first push): every Linux job, FreeBSD, linux-tsan green; macos-arm64 and macos-x86_64 failed (`reactor` timeout, rerun failed the same): the accept-backlog hang, open question 6. Run 41573979883 (with the fix): macos-arm64, macos-x86_64, linux-x86_64-gcc, linux-x86_64-clang, linux-arm64-gcc, linux-asan-ubsan, linux-tsan, freebsd-x86_64 all success; the `headers` job is skipped (not enabled in reactor's workflow).
+- The Linux box lease ended partway; the rest ran locally (macOS Apple clang Debug and RelWithDebInfo, `quiet light`).

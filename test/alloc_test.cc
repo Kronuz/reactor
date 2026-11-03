@@ -77,12 +77,10 @@ static double per_connection(std::size_t reactors, bool reuse_port) {
 
 int main() {
 	struct Case { const char* name; std::size_t reactors; bool reuse_port; double head; };
-	// head: reactor:ade618d, the same program with the awaitable Session (Linux x86-64, clang 18);
+	// head: reactor:ade618d, the same program with the awaitable Session (Linux x86-64 with clang 18, macOS x86-64 with Apple clang: the same counts);
 	// a negative bound only reports.
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
 	const double head_one = 9.0, head_shared = 7.5;
-#elif defined(__APPLE__)
-	const double head_one = -1, head_shared = -1;
 #else
 	const double head_one = -1, head_shared = -1;
 #endif
