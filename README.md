@@ -135,6 +135,10 @@ cmake --build build --target reactor_echo_bench
   contract.
 - [ARCHITECTURE.md](ARCHITECTURE.md): the loops, the bind modes, admission, and the shutdown
   stages.
+- [docs/mechanisms/sessions-and-schedulers.md](docs/mechanisms/sessions-and-schedulers.md): how a
+  session runs as a task and how a reactor owns its scheduler.
+- [docs/mechanisms/stop-and-accept.md](docs/mechanisms/stop-and-accept.md): the bounded stop, the
+  teardown phases, and accept retry and listener loss.
 - [AGENTS.md](AGENTS.md): repository map, invariants, and traps.
 - [CHANGELOG.md](CHANGELOG.md): dated changes.
 - [Catalog entry](https://github.com/Kronuz/cpp-libraries/blob/main/AGENTS.md#reactor) in Kronuz
