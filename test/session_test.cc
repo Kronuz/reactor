@@ -2,6 +2,7 @@
 // mid-read and never started, admission refusals, the UDP receive loop, and the four phases across
 // servers in both orders. Every test ends with task::detail::live_frames() back at its baseline.
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -25,6 +26,20 @@ static void wait_for(const std::function<bool()>& done, std::chrono::millisecond
 }
 static double ms_since(std::chrono::steady_clock::time_point began) {
 	return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - began).count();
+}
+// Runs f and returns how long it took; a call still running after `limit` fails the test and ends
+// the program, so a hang does not stall the suite.
+static double returns_within(const std::string& what, std::chrono::milliseconds limit, std::function<void()> f) {
+	auto done = std::make_shared<std::promise<void>>();
+	auto future = done->get_future();
+	const auto began = std::chrono::steady_clock::now();
+	std::thread([f = std::move(f), done] { f(); done->set_value(); }).detach();
+	if (future.wait_for(limit) != std::future_status::ready) {
+		std::printf("FAIL: %s did not return within %lld ms\n", what.c_str(), static_cast<long long>(limit.count()));
+		std::fflush(stdout);
+		std::_Exit(1);
+	}
+	return ms_since(began);
 }
 
 // A session that reads until the peer closes or the stop token is requested, then answers
@@ -106,7 +121,7 @@ static void never_started() {
 		Reactor r;
 		r.abort_all();   // the walk has passed (no loop claimed: inline)
 		Pair pair(r);
-		reactor::detail::launch_session(r, session, std::move(pair.server), SessionContext{}, std::move(*admission.try_enter()));
+		reactor::detail::launch_session(r, session, std::move(pair.server), asio::ip::tcp::endpoint{}, SessionContext{}, std::move(*admission.try_enter()));
 		check(admission.stats().active == 1, "[N] a launched session holds its admission before it runs");
 		r.io().run();
 		check(ran == 0, "[N] a session launched after the walk never runs");
@@ -117,7 +132,7 @@ static void never_started() {
 	{
 		Reactor r;
 		Pair pair(r);
-		reactor::detail::launch_session(r, session, std::move(pair.server), SessionContext{}, std::move(*admission.try_enter()));
+		reactor::detail::launch_session(r, session, std::move(pair.server), asio::ip::tcp::endpoint{}, SessionContext{}, std::move(*admission.try_enter()));
 		r.io().stop();
 		r.scheduler().close();
 		r.scheduler().destroy_roots();
@@ -128,7 +143,7 @@ static void never_started() {
 	{
 		auto r = std::make_unique<Reactor>();
 		Pair pair(*r);
-		reactor::detail::launch_session(*r, session, std::move(pair.server), SessionContext{}, std::move(*admission.try_enter()));
+		reactor::detail::launch_session(*r, session, std::move(pair.server), asio::ip::tcp::endpoint{}, SessionContext{}, std::move(*admission.try_enter()));
 		r.reset();   // ~Reactor stops the loop and the scheduler destroys the queued root
 		check(ran == 0 && admission.stats().active == 0, "[N] destroying a Reactor destroys its queued sessions and refunds");
 		::close(pair.client);
@@ -399,6 +414,151 @@ static void phases_idempotent() {
 	check(task::detail::live_frames() == base, "[P] repeated phases are idempotent");
 }
 
+// [B] stop() is bounded. A session whose socket wait does not take the token (a read from an idle
+// peer, a write to a peer that does not read) ends when force() shuts its connection down after the
+// grace: the wait fails, the frame runs to its end, and stop() returns soon after the grace.
+static void tokenless_waits_end_after_grace() {
+	const auto base = task::detail::live_frames();
+	for (bool write : {false, true}) {
+		const std::string label = write ? "[B] a write without the token" : "[B] a read without the token";
+		std::atomic<int> started{0}, failed{0}, ended{0};
+		int fd = -1;
+		{
+			reactor::TcpServer server(1, 0, [&, write](asio::ip::tcp::socket socket, Reactor&, SessionContext) -> task::task<void> {
+				++started;
+				if (write) {
+					std::vector<char> big(64 << 20, 'x');
+					const auto [error, n] = co_await test::write_all(socket, asio::buffer(big));
+					if (error) { ++failed; }
+				} else {
+					char byte;
+					const auto [error, n] = co_await test::read_some(socket, asio::buffer(&byte, 1));
+					if (error) { ++failed; }
+				}
+				++ended;
+			});
+			reactor::BindOptions bind; bind.address = "127.0.0.1"; server.set_bind_options(bind);
+			server.set_shutdown_grace(150ms);
+			const auto port = test::free_port();
+			server.start(port);
+			fd = test::connect_port(port);
+			int small = 4096; ::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &small, sizeof(small));
+			wait_for([&] { return started == 1; });
+			std::this_thread::sleep_for(20ms);   // the write has filled the buffers
+			check(started == 1 && ended == 0, label + ": the session waits");
+			const double took = returns_within(label + ": stop()", 5000ms, [&] { server.stop(); });
+			std::printf("     %s: stop() returned in %.1f ms (grace 150 ms)\n", label.c_str(), took);
+			check(took >= 140.0 && took < 1150.0, label + ": stop() returns after the grace, within a bound");
+			check(failed == 1 && ended == 1, label + ": the wait failed once the connection was shut down, and the frame ran to its end");
+		}
+		if (fd >= 0) { ::close(fd); }
+		check(task::detail::live_frames() == base, label + ": no task frame is left");
+	}
+}
+
+// [C] Phase 1 across servers whose session waits, with its token, on the other server's loop: stop()
+// returns in either order (a then b ends the wait; b then a leaves it on b's stopped loop for phase
+// 3), and the phases across both destroy what is left.
+static void cross_server_stop_orders() {
+	for (bool a_first : {true, false}) {
+		const std::string label = a_first ? "[C] stop() a then b" : "[C] stop() b then a";
+		const auto base = task::detail::live_frames();
+		Cross state;
+		std::atomic<int> ended{0};
+		auto b = std::make_unique<reactor::TcpServer>(1, 0, [](asio::ip::tcp::socket, Reactor&, SessionContext) -> task::task<void> { co_return; });
+		reactor::BindOptions bind; bind.address = "127.0.0.1";
+		b->set_bind_options(bind);
+		b->set_shutdown_grace(100ms);
+		b->start(0);
+		Reactor* other = &b->reactor(0);
+		auto a = std::make_unique<reactor::TcpServer>(1, 0, [&state, &ended, other](asio::ip::tcp::socket, Reactor&, SessionContext context) -> task::task<void> {
+			co_await task::schedule_on{task::scheduler_ref::of(other->scheduler())};
+			asio::steady_timer timer(other->io(), 1h);
+			CrossGuard guard(state);
+			state.suspended = true;
+			co_await test::wait_timer(timer, context.stop);
+			++ended;
+		});
+		a->set_bind_options(bind);
+		a->set_shutdown_grace(100ms);
+		const auto port = test::free_port();
+		a->start(port);
+		int fd = test::connect_port(port);
+		wait_for([&] { return state.suspended.load(); });
+		check(state.suspended, label + ": a's session waits on b's timer");
+		const double took = returns_within(label, 5000ms, [&] { if (a_first) { a->stop(); b->stop(); } else { b->stop(); a->stop(); } });
+		std::printf("     %s: %.1f ms (grace 100 ms)\n", label.c_str(), took);
+		check(took < 1200.0, label + ": phase 1 returns within twice the grace and a bound");
+		if (a_first) {
+			check(ended == 1 && state.destroyed == 1, label + ": the session's wait ended with its token and the frame ran to its end");
+		} else {
+			check(ended == 0 && state.destroyed == 0, label + ": the session is left suspended on b's stopped loop");
+		}
+		a->close(); b->close();
+		a->destroy_roots(); b->destroy_roots();
+		check(state.destroyed == 1 && task::detail::live_frames() == base, label + ": phase 3 destroyed what was left; no task frame is left");
+		a.reset(); b.reset();
+		if (fd >= 0) { ::close(fd); }
+	}
+}
+
+// [O] The phase calls in every order: each subset of stop(), close() and destroy_roots() in each
+// order, then destruction. Each call runs the earlier phases not yet run, so none deadlocks or
+// destroys a root under a running loop, and sessions mid-read with the token end at the stop the
+// order implies.
+static void phase_orders() {
+	const char* names[] = {"stop", "close", "destroy_roots"};
+	std::vector<std::vector<int>> orders;
+	for (int mask = 0; mask != 8; ++mask) {
+		std::vector<int> calls;
+		for (int i = 0; i != 3; ++i) { if (mask & (1 << i)) { calls.push_back(i); } }
+		do { orders.push_back(calls); } while (std::next_permutation(calls.begin(), calls.end()));
+	}
+	int ended_by_calls = 0, clean = 0;
+	for (const auto& calls : orders) {
+		std::string label = "[O]";
+		for (int c : calls) { label += std::string(" ") + names[c]; }
+		label += " ~";
+		const auto base = task::detail::live_frames();
+		std::atomic<int> started{0}, ended{0};
+		std::vector<int> clients;
+		auto tcp = std::make_unique<reactor::TcpServer>(2, 0, [&](asio::ip::tcp::socket socket, Reactor&, SessionContext context) -> task::task<void> {
+			++started;
+			char byte;
+			co_await test::read_some(socket, asio::buffer(&byte, 1), context.stop);
+			++ended;
+		});
+		reactor::BindOptions bind; bind.address = "127.0.0.1"; tcp->set_bind_options(bind);
+		const auto port = test::free_port();
+		tcp->start(port);
+		for (int i = 0; i != 4; ++i) { clients.push_back(test::connect_port(port)); }
+		wait_for([&] { return started == 4; });
+		std::atomic<int> got{0};
+		auto udp = std::make_unique<reactor::UdpServer>([&](std::string_view, const asio::ip::udp::endpoint&) { ++got; });
+		reactor::UdpOptions options; options.address = "127.0.0.1"; udp->set_options(options);
+		const auto udp_port = free_udp_port();
+		udp->start(udp_port);
+		send_unicast(udp_port, "a");
+		wait_for([&] { return got == 1; });
+		returns_within(label, 5000ms, [&] {
+			for (int c : calls) {
+				if (c == 0) { tcp->stop(); udp->stop(); }
+				if (c == 1) { tcp->close(); udp->close(); }
+				if (c == 2) { tcp->destroy_roots(); udp->destroy_roots(); }
+			}
+			const bool stopped = ended == 4;
+			tcp.reset();
+			udp.reset();
+			if (stopped || calls.empty()) { ++ended_by_calls; }
+		});
+		if (started == 4 && ended == 4 && task::detail::live_frames() == base) { ++clean; }
+		else { check(false, label + ": the sessions ended and no task frame is left"); }
+		for (int fd : clients) { if (fd >= 0) { ::close(fd); } }
+	}
+	check(ended_by_calls == static_cast<int>(orders.size()), "[O] in every order the calls before destruction ended the sessions mid-read");
+	check(clean == static_cast<int>(orders.size()), "[O] " + std::to_string(orders.size()) + " orders of the phase calls (tcp and udp): none hangs, the sessions end, no task frame is left");
+}
+
 int main() {
 	std::setvbuf(stdout, nullptr, _IOLBF, 0);
 	std::printf("== reactor session test ==\n");
@@ -414,6 +574,9 @@ int main() {
 	teardown_orders();
 	phases_with_external_scheduler();
 	phases_idempotent();
+	tokenless_waits_end_after_grace();
+	cross_server_stop_orders();
+	phase_orders();
 	std::printf("\n%s (%d failures)\n", g_fail == 0 ? "PASS" : "FAIL", g_fail);
 	return g_fail == 0 ? 0 : 1;
 }

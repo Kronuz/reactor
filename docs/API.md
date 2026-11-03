@@ -19,9 +19,11 @@ auto [error, n] = co_await task::await_asio<void(asio::error_code, std::size_t)>
 ```
 
 A read that takes the token ends with `operation_aborted` (immediately, without starting, when
-the token was requested before it began) and the session finishes normally; one that does not
-take it runs until it completes or `force()` closes the socket after the grace. An exception
-that escapes the session (including `task::cancelled`) ends the connection and is dropped.
+the token was requested before it began) and the session finishes normally. A wait on the socket
+that does not take it ends when `force()` shuts the connection down after the grace; a session
+still waiting on anything else after twice the grace stays suspended until `destroy_roots()`
+destroys it. `stop()` never waits longer than that. An exception that escapes the session
+(including `task::cancelled`) ends the connection and is dropped.
 
 Each `Reactor` owns one `task::asio_scheduler`, `reactor(i).scheduler()`, for its loop. The
 session, the accept loops and `UdpServer`'s receive loop are tasks spawned on it, and a host may
@@ -29,10 +31,12 @@ spawn its own there. Link `task::asio` (the CMake target `reactor` does).
 
 ### Teardown: task's four phases
 
-`TcpServer` and `UdpServer` expose them as calls, each idempotent:
+`TcpServer` and `UdpServer` expose them as calls, each idempotent and each running the earlier
+phases not yet run, so the calls are safe in any order:
 
-1. `stop()`: sessions' tokens are requested, accepts end, sessions get the grace, the loops stop
-   and their threads join.
+1. `stop()`: sessions' tokens are requested, accepts end, sessions get the grace, their
+   connections are shut down and they get the grace once more, then the loops stop and their
+   threads join.
 2. `close()`: the schedulers drop what is posted to them and destroy what is spawned on them.
 3. `destroy_roots()`: the tasks still suspended are destroyed, with every `io_context` alive.
 4. Destruction: each scheduler, then its loop.
@@ -61,9 +65,9 @@ next; the `io_context` is not run again after phase 3.
   loop only. `stop()` runs `abort()` on each (on its loop) before stopping the loops: a
   read ends at its next checkpoint, a write is left to finish. After the shutdown grace
   (`TcpServer::set_shutdown_grace`, 5 s by default) it runs `force()` on whatever is
-  still tracked, which closes the socket a stalled peer holds, and then waits for the
-  sessions to end. The wait for a session's own work has no bound: a session must honor
-  `abort()`.
+  still tracked, which shuts each session's connection down and closes what a stalled peer
+  holds, and waits the grace once more before it stops the loops. A session still running then
+  is destroyed in `destroy_roots()`.
 
 ## Knowing you are on a loop
 

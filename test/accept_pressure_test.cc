@@ -120,6 +120,35 @@ void qualify_reset_backlog() {
 	check(std::chrono::steady_clock::now() - began < std::chrono::milliseconds(500));
 	check(control->retry_delay == std::chrono::milliseconds(10));
 }
+// EINVAL skips one connection on macOS (a peer that reset while queued) only while the acceptor is
+// still the bound listener; on a socket that no longer is, it ends the accept loop like any listener
+// failure, instead of a retry every millisecond.
+void qualify_lost_listener() {
+	asio::io_context io;
+	task::asio_scheduler scheduler(io.get_executor());
+	auto control = std::make_shared<reactor::detail::AcceptControl>(io);
+	auto& acceptor = *control->acceptor;
+	acceptor.open(asio::ip::tcp::v4());
+	acceptor.bind({asio::ip::address_v4::loopback(), 0});
+	acceptor.listen();
+	control->bound = acceptor.local_endpoint();
+	const asio::error_code invalid(EINVAL, asio::system_category());
+	int listening = -1, lost = -1;
+	task::spawn(task::scheduler_ref::of(scheduler),
+		[](std::shared_ptr<reactor::detail::AcceptControl> control, asio::error_code invalid, int& listening, int& lost) -> task::task<void> {
+			try { listening = (co_await control->retry(invalid)) ? 1 : 0; } catch (const asio::system_error&) { listening = 2; }
+			control->acceptor->close();
+			control->acceptor->open(asio::ip::tcp::v4());   // the descriptor no longer names the listener
+			try { lost = (co_await control->retry(invalid)) ? 1 : 0; } catch (const asio::system_error&) { lost = 2; }
+		}(control, invalid, listening, lost));
+	io.run();
+#ifdef __APPLE__
+	check(listening == 1);   // skipped: a reset queued connection
+#else
+	check(listening == 2);   // EINVAL is a listener failure elsewhere
+#endif
+	check(lost == 2);
+}
 void qualify(bool reuse_port) {
 	const auto port = unused_port();
 	Socket first, second;
@@ -167,6 +196,7 @@ int main() {
 	try {
 		qualify_retry_cancel();
 		qualify_reset_backlog();
+		qualify_lost_listener();
 		qualify(false);
 #ifdef __linux__
 		qualify(true);

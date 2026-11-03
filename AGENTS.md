@@ -66,7 +66,7 @@ docs/reactor.d2      The README and ARCHITECTURE diagram's source (docs/reactor.
   N threads, each with an `AdmissionGate` of `admission_limit` requests in flight (0 => no cap).
   `set_bind_options()`, `set_shutdown_grace()` (5 s by default), `start(port)` (binds,
   runs, returns). Teardown is task's four phases as calls: `stop()` (request every session's
-  token → grace → force → stop → join), `close()` (close the reactors' schedulers),
+  token → grace → force → grace → stop → join), `close()` (close the reactors' schedulers),
   `destroy_roots()` (destroy the tasks still suspended), then destruction. The destructor runs
   any phase not yet run; a process with several servers or loops runs each phase on all of them
   before the next. `UdpServer` has the same three calls.
@@ -102,12 +102,13 @@ docs/reactor.d2      The README and ARCHITECTURE diagram's source (docs/reactor.
 - **Never run blocking or CPU-heavy work on a reactor thread.** There is no worker pool:
   a Session that must wait suspends its coroutine, and a host's own pool resumes it on
   the loop. Blocking the loop stalls every connection on it.
-- **Anything a Session can wait on must be an `Abortable` and `track()`ed** before it
-  waits, or `stop()` will hang. `abort()` releases the wait; `force()` releases the
-  socket a stalled peer holds. Track and untrack on the reactor's loop only: the list is
+- **A Session's waits take its token, or what they wait on is an `Abortable` `track()`ed**
+  before it waits. `abort()` releases the wait; `force()` releases the socket a stalled peer
+  holds. A socket wait on neither ends only when `force()` shuts the connection down after the
+  grace; any other such wait outlives `stop()` until `destroy_roots()` destroys it. Track and untrack on the reactor's loop only: the list is
   intrusive and unlocked, and `abort_all()` posts its walk to that loop.
-- **Shutdown order is abort → close and reap accepts → grace → force → wait for sessions → clear guards → stop → join** (`stop()`), then `close()`, then `destroy_roots()`. Don't reorder;
-  each step depends on the previous. See `TcpServer::stop()`.
+- **Shutdown order is abort → close and reap accepts → grace → force → grace → clear guards → stop → join** (`stop()`), then `close()`, then `destroy_roots()`; each runs the earlier phases not yet run. Don't reorder;
+  each step depends on the previous. `stop()` never waits on a session without bound. See `TcpServer::stop()`.
 - **The shared-acceptor path needs the work guards.** Idle reactors' `run()` returns
   immediately without them. Don't remove the `make_work_guard` loop.
 - **macOS/BSD reject a second same-port bind without `SO_REUSEPORT`.** The shared

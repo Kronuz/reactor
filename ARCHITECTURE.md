@@ -127,8 +127,8 @@ runs a strict order:
     1. reactor.abort_all()   for every reactor  -- on each loop: abort() every tracked Abortable
     2. close and reap accepts on their owner loops -- all peer socket services remain alive
     3. wait for the sessions, up to the grace      -- a read ends at abort(); a write may finish
-    4. reactor.force_all()   if any are left       -- force() closes what a stalled peer holds
-    5. wait for the sessions                       -- each ends once its socket is closed
+    4. reactor.force_all()   if any are left       -- force() shuts each session's connection down
+    5. wait for the sessions, up to the grace      -- each ends once its socket wait ends
     6. clear work guards                           -- idle reactors may now drain
     7. io.stop() for every reactor, then thread.join() for every thread
 ```
@@ -136,16 +136,19 @@ runs a strict order:
 Anything a Session can wait on registers with `Reactor::track(a)` as an `Abortable`;
 step 1 calls its `abort()`, which requests: the wait ends at its next checkpoint, and a
 write is left to finish. Step 4's `force()` is the second stage: it releases the
-resource a write is blocked on. The bound is therefore the grace
-(`set_shutdown_grace`, 5 s by default) plus the time to unwind the sessions; a Session
-that ignores `abort()` and holds no socket `force()` can close waits for as long as it
-runs.
+resource a write is blocked on, and each session's own control shuts its connection down
+(`shutdown(2)` on the accepted descriptor, while it still names that peer), which ends any
+wait on the socket that does not take the token. `stop()` returns within twice the grace
+(`set_shutdown_grace`, 5 s by default) plus the time to stop and join the loops; a session
+still running then (one waiting on another server's loop) stays suspended until
+`destroy_roots()` destroys it.
 
 `stop()` is the first of task's four teardown phases. `close()` closes every reactor's
 `task::asio_scheduler` (what is posted to it is dropped, what is spawned on it is destroyed
 unrun), and `destroy_roots()` destroys the tasks still suspended on them, with every
 `io_context` alive; then the destructors destroy each scheduler and its loop. Each phase is
-idempotent and the destructor runs any not yet run. A process with several servers, pools or
+idempotent and runs the earlier phases not yet run, so the calls are safe in any order; the
+destructor runs any not yet run. A process with several servers, pools or
 loops that tasks may be suspended on runs each phase on all of them before the next: a task
 on one server's scheduler may sit on another's timer, and destroying it needs both alive.
 
@@ -154,7 +157,8 @@ O(1) with no allocation and no lock, and are made on the reactor's loop. `abort_
 and `force_all()` called from another thread post their walk to the loop and return
 after it, because an Abortable's owner lives on that loop; a host that drives a loop
 on its own thread brackets the thread with `claim_loop()`/`release_loop()` so the walk
-is posted rather than run on the caller. `abort()` may run `untrack` on any node. Tracking after the abort walk aborts at once, and after
+is posted rather than run on the caller; when the loop's last thread leaves `run()` before the
+posted walk runs, the caller runs it. `abort()` may run `untrack` on any node. Tracking after the abort walk aborts at once, and after
 the force walk forces at once, so a request that starts late in shutdown cannot wait on a peer forever. The destructor calls `stop()`, so a `TcpServer`
 going out of scope tears down cleanly on its own.
 

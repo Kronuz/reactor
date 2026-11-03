@@ -61,6 +61,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <condition_variable>
 #include <memory>
@@ -184,6 +185,8 @@ struct AdmissionGate {
 	Lease enter() { return try_enter() ? Lease(this) : Lease(); }
 };
 
+namespace detail { struct ReactorLayout; }
+
 // One reactor: an io_context (the loop, one thread) + the admission gate + the list of
 // abortables to release at shutdown + the task scheduler of the loop. Nothing runs off the
 // loop: there is no worker pool.
@@ -193,7 +196,11 @@ public:
 	explicit Reactor(int admission_limit = 0) : gate_(admission_limit) {}
 
 	// Stops the loop, so the scheduler (destroyed first) may destroy roots still suspended on it.
-	~Reactor() { io_.stop(); }
+	// No thread may still run it: a claimed loop is released when its thread leaves run().
+	~Reactor() {
+		assert(loops_.load() == 0);
+		io_.stop();
+	}
 
 	Reactor(const Reactor&) = delete;
 	Reactor& operator=(const Reactor&) = delete;
@@ -210,9 +217,12 @@ public:
 
 	// A host that drives the loop on its own thread claims it around the thread's life, so
 	// abort_all()/force_all() post to the loop instead of walking the list from the caller.
-	// TcpServer and UdpServer do this.
+	// TcpServer and UdpServer do this; the thread releases it once it has left run().
 	void claim_loop() noexcept { loops_.fetch_add(1); }
-	void release_loop() noexcept { loops_.fetch_sub(1); }
+	void release_loop() noexcept {
+		{ std::lock_guard<std::mutex> lock(sync_mutex_); loops_.fetch_sub(1); }
+		sync_changed_.notify_all();   // an on_loop_sync() waiting on this loop runs its call itself
+	}
 
 	// Register an abortable. Call on the loop (or with no loop running). O(1), no allocation.
 	// Tracking after abort_all() aborts it at once, and after force_all() forces it too, so a
@@ -254,22 +264,36 @@ public:
 	bool stopping() const noexcept { return aborting_.load(); }
 
 private:
-	// Runs f on the loop and returns after it ran. The wait uses members, not heap state: a
-	// shutdown may run with the process out of descriptors, where even a sanitizer's first
-	// lookup of a shared_ptr's type can fail. The posted handler notifies under the lock,
-	// so it never touches the reactor after the caller can return.
+	friend struct detail::ReactorLayout;
+
+	// Runs f on the loop and returns after it ran; when the loop's last thread leaves run() first
+	// (a host stopped the loop), f runs here instead. Whichever side takes the call (sync_open_)
+	// runs f, once. The wait uses members, not heap state: a shutdown may run with the process
+	// out of descriptors, where even a sanitizer's first lookup of a shared_ptr's type can fail.
+	// The posted handler notifies under the lock, so it never touches the reactor after the
+	// caller can return.
 	template <class F> void on_loop_sync(F&& f) {
 		if (loops_.load() == 0 || on_loop()) { f(); return; }
 		std::lock_guard<std::mutex> call(sync_call_);
-		sync_done_ = false;
-		asio::post(io_, [this, &f] {
+		const std::uint64_t id = ++sync_calls_;
+		{ std::lock_guard<std::mutex> lock(sync_mutex_); sync_open_ = id; }
+		asio::post(io_, [this, &f, id] {
+			{
+				std::lock_guard<std::mutex> lock(sync_mutex_);
+				if (sync_open_ != id) { return; }   // the caller took it: f is gone
+				sync_open_ = 0;
+			}
 			f();
 			std::lock_guard<std::mutex> lock(sync_mutex_);
-			sync_done_ = true;
+			sync_done_ = id;
 			sync_changed_.notify_all();
 		});
 		std::unique_lock<std::mutex> lock(sync_mutex_);
-		sync_changed_.wait(lock, [this] { return sync_done_; });
+		sync_changed_.wait(lock, [&] { return sync_done_ == id || (sync_open_ == id && loops_.load() == 0); });
+		if (sync_done_ == id) { return; }
+		sync_open_ = 0;
+		lock.unlock();
+		f();
 	}
 
 	AbortList aborts_;              // before io_: pending handlers die with io_, then the list
@@ -282,12 +306,32 @@ private:
 	std::atomic<int> loops_{0};
 	std::mutex sync_call_, sync_mutex_;     // on_loop_sync: one waiter at a time
 	std::condition_variable sync_changed_;
-	bool sync_done_ = false;
+	std::uint64_t sync_calls_ = 0;          // under sync_call_
+	std::uint64_t sync_open_ = 0, sync_done_ = 0;   // under sync_mutex_: the call not yet taken, the last one done
 	std::mutex session_mutex_;
 	std::condition_variable session_changed_;
 	std::size_t sessions_ = 0;
 	task::asio_scheduler scheduler_{io_.get_executor()};   // last: destroyed first, while the rest is alive
 };
+
+namespace detail {
+// Pins Reactor's member order: the scheduler is destroyed first, so a root it destroys (a
+// session's control) still reaches the loop, the abortables and the session count.
+struct ReactorLayout {
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Winvalid-offsetof"
+#endif
+	static constexpr std::size_t scheduler = offsetof(Reactor, scheduler_);
+	static_assert(scheduler > offsetof(Reactor, io_) && scheduler > offsetof(Reactor, aborts_) &&
+		scheduler > offsetof(Reactor, gate_) && scheduler > offsetof(Reactor, session_mutex_) &&
+		scheduler > offsetof(Reactor, session_changed_) && scheduler > offsetof(Reactor, sessions_),
+		"Reactor::scheduler_ must be declared after what its roots reach");
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
+};
+}  // namespace detail
 
 // The per-connection task: given an accepted socket, its reactor and its context, serve the
 // connection to completion. The protocol lives entirely here. `stop` is requested at
@@ -300,14 +344,26 @@ using Session = std::function<task::task<void>(asio::ip::tcp::socket, Reactor&, 
 
 namespace detail {
 
+// Shuts the connection down (shutdown(2)), which ends every wait on its socket, while
+// `descriptor` still names it: the session may have closed its socket and the number been reused.
+inline void shutdown_connection(int descriptor, const asio::ip::tcp::endpoint& peer) noexcept {
+	asio::ip::tcp::endpoint current;
+	socklen_t size = static_cast<socklen_t>(current.capacity());
+	if (::getpeername(descriptor, current.data(), &size) != 0 || size > current.capacity()) { return; }
+	current.resize(size);
+	if (current == peer) { ::shutdown(descriptor, SHUT_RDWR); }
+}
+
 // Shutdown retains each session until its spawn's completion runs (or its root is destroyed).
 struct SessionControl : Abortable {
-	explicit SessionControl(Reactor& owner, ConnectionAdmission::Lease admitted)
-		: reactor(owner), admission(std::move(admitted)) { reactor.session_started(); }
+	SessionControl(Reactor& owner, ConnectionAdmission::Lease admitted, int fd, const asio::ip::tcp::endpoint& from)
+		: reactor(owner), admission(std::move(admitted)), descriptor(fd), peer(from) { reactor.session_started(); }
 	~SessionControl() { finish(); }
 	Reactor& reactor;
 	ConnectionAdmission::Lease admission;
 	task::cancel_source stop;
+	const int descriptor;                    // the accepted connection, for force()
+	const asio::ip::tcp::endpoint peer;
 	std::atomic<bool> finished{false};
 	std::atomic<bool> aborted{false};
 	// On the loop (a late track() aborts there too), or on the caller when no loop is claimed.
@@ -315,6 +371,8 @@ struct SessionControl : Abortable {
 		aborted.store(true);
 		stop.request(task::cancel_reason::shutdown);
 	}
+	// After the grace: the connection is shut down, so a wait that does not take the token ends.
+	void force() override { shutdown_connection(descriptor, peer); }
 	void finish() {
 		if (!finished.exchange(true)) { reactor.untrack(*this); admission.reset(); reactor.session_finished(); }
 	}
@@ -329,8 +387,8 @@ inline task::task<void> run_session(std::shared_ptr<SessionControl> control, con
 }
 // The control is counted before spawning, so the accept barrier covers it.
 inline void launch_session(Reactor& reactor, const Session& session, asio::ip::tcp::socket socket,
-	SessionContext context, ConnectionAdmission::Lease admission) {
-	auto control = std::make_shared<SessionControl>(reactor, std::move(admission));
+	const asio::ip::tcp::endpoint& peer, SessionContext context, ConnectionAdmission::Lease admission) {
+	auto control = std::make_shared<SessionControl>(reactor, std::move(admission), socket.native_handle(), peer);
 	reactor.lag().note_activity();
 	context.stop = control->stop.token();
 	try {
@@ -375,9 +433,18 @@ struct AcceptControl {
 	// Consecutive per-connection errors skipped without a pause; past 64 each pauses 1 ms, so a
 	// listener that only ever fails this way does not spin.
 	unsigned skipped = 0;
+	asio::ip::tcp::endpoint bound;   // where the listener listens
+	// macOS reports a peer that reset while queued as EINVAL, and also a socket that is not
+	// listening: EINVAL skips a connection only while the acceptor is still the bound listener.
+	bool listener_lost(const asio::error_code& error) const {
+		if (error.value() != EINVAL || error.category() != asio::system_category()) { return false; }
+		asio::error_code local_error;
+		const auto local = acceptor->local_endpoint(local_error);
+		return local_error || local != bound;
+	}
 	task::task<bool> retry(asio::error_code error) {
 		if (stopping.load()) { co_return false; }
-		const bool per_connection = per_connection_accept_error(error);
+		const bool per_connection = per_connection_accept_error(error) && !listener_lost(error);
 		if (per_connection && ++skipped <= 64) { co_return true; }
 		if (!per_connection && !retryable_accept_error(error)) { throw asio::system_error(error); }
 		// Past the free skips a per-connection error pauses a flat 1 ms: a backlog of reset
@@ -448,10 +515,12 @@ inline task::task<void> accept_loop(Reactor* reactor, const Session* session,
 	acceptor.bind(ep);
 	acceptor.listen(bind.backlog);
 	control->listening();
+	control->bound = acceptor.local_endpoint();
+	tcp::endpoint peer;
 	while (!control->stopping.load()) {
 		tcp::socket socket(reactor->io());
 		const auto error = co_await task::await_asio<void(asio::error_code)>(
-			[&](auto handler) { acceptor.async_accept(socket, std::move(handler)); });
+			[&](auto handler) { acceptor.async_accept(socket, peer, std::move(handler)); });
 		if (error) { if (co_await control->retry(error)) { continue; } co_return; }
 		control->retry_delay = std::chrono::milliseconds(10);
 		control->skipped = 0;
@@ -460,7 +529,7 @@ inline task::task<void> accept_loop(Reactor* reactor, const Session* session,
 		std::optional<ConnectionAdmission::Lease> lease;
 		if (admission) { lease = admission->try_enter(); if (!lease) { continue; } }
 		bool pressure = false;
-		try { launch_session(*reactor, *session, std::move(socket), std::move(context), lease ? std::move(*lease) : ConnectionAdmission::Lease{}); }
+		try { launch_session(*reactor, *session, std::move(socket), peer, std::move(context), lease ? std::move(*lease) : ConnectionAdmission::Lease{}); }
 		catch (const std::bad_alloc&) { pressure = true; }
 		if (pressure && !(co_await control->retry(asio::error::no_memory))) { co_return; }
 	}
@@ -485,13 +554,15 @@ inline task::task<void> shared_accept_loop(std::vector<Reactor*> reactors, const
 	acceptor.bind(ep);
 	acceptor.listen(bind.backlog);
 	control->listening();
+	control->bound = acceptor.local_endpoint();
+	tcp::endpoint peer;
 	std::size_t next = 0;
 	while (!control->stopping.load()) {
 		Reactor* r = reactors[next];
 		next = (next + 1 == reactors.size()) ? 0 : next + 1;
 		tcp::socket socket(r->io());   // accepted directly onto the destination loop
 		const auto error = co_await task::await_asio<void(asio::error_code)>(
-			[&](auto handler) { acceptor.async_accept(socket, std::move(handler)); });
+			[&](auto handler) { acceptor.async_accept(socket, peer, std::move(handler)); });
 		if (error) { if (co_await control->retry(error)) { continue; } co_return; }
 		control->retry_delay = std::chrono::milliseconds(10);
 		control->skipped = 0;
@@ -500,7 +571,7 @@ inline task::task<void> shared_accept_loop(std::vector<Reactor*> reactors, const
 		std::optional<ConnectionAdmission::Lease> lease;
 		if (admission) { lease = admission->try_enter(); if (!lease) { continue; } }
 		bool pressure = false;
-		try { launch_session(*r, *session, std::move(socket), std::move(context), lease ? std::move(*lease) : ConnectionAdmission::Lease{}); }
+		try { launch_session(*r, *session, std::move(socket), peer, std::move(context), lease ? std::move(*lease) : ConnectionAdmission::Lease{}); }
 		catch (const std::bad_alloc&) { pressure = true; }
 		if (pressure && !(co_await control->retry(asio::error::no_memory))) { co_return; }
 	}
@@ -517,9 +588,10 @@ inline task::task<void> shared_accept_loop(std::vector<Reactor*> reactors, const
 // Teardown follows task's four phases, each a call: stop() (stop the loops: sessions are asked
 // to stop, accept loops end, threads join), close() (the reactors' schedulers drop what is posted
 // and destroy what is spawned), destroy_roots() (destroy the tasks still suspended), then
-// destruction. A process with several servers, pools or schedulers that tasks may be suspended
-// on runs each phase on all of them before the next. The destructor runs every phase not yet
-// run, so a caller that only destroys the server is safe when nothing else outlives it.
+// destruction. Each call runs the earlier phases not yet run, so any order is safe. A process
+// with several servers, pools or schedulers that tasks may be suspended on runs each phase on all
+// of them before the next. The destructor runs every phase not yet run, so a caller that only
+// destroys the server is safe when nothing else outlives it.
 class TcpServer {
 public:
 	TcpServer(std::size_t reactors, int admission_limit, Session session,
@@ -531,7 +603,7 @@ public:
 		}
 	}
 
-	~TcpServer() { stop(); close(); destroy_roots(); }
+	~TcpServer() { destroy_roots(); }
 
 	TcpServer(const TcpServer&) = delete;
 	TcpServer& operator=(const TcpServer&) = delete;
@@ -546,9 +618,8 @@ public:
 	std::shared_ptr<const ConnectionAdmission> connection_observer() const noexcept { return admission_; }
 
 	// How long stop() lets in-flight sessions finish after abort() before it force()s what
-	// is left; the default is 5 s. A session's cooperative waits (reads, checkpoints) end at
-	// abort(); this bounds only I/O a peer stalls, such as a write to a client that stopped
-	// reading. Set before start().
+	// is left; the default is 5 s. A session's waits that take its token end at abort(); the
+	// grace bounds the rest, such as a write to a client that stopped reading. Set before start().
 	void set_shutdown_grace(std::chrono::milliseconds grace) { grace_ = grace; }
 
 	std::size_t reactors() const { return n_; }
@@ -562,7 +633,7 @@ public:
 	// Bind + run all reactors (each on its own thread). Returns once the threads are
 	// listening; bind/listen errors propagate after cleanup. stop() tears down.
 	void start(unsigned short port) {
-		if (started_) { throw std::logic_error("TCP server cannot be restarted"); }
+		if (started_ || stopped_) { throw std::logic_error("TCP server cannot be restarted"); }
 		started_ = true;
 		try {
 		bool shared = !bind_.reuse_port && reactors_.size() > 1;
@@ -577,7 +648,7 @@ public:
 		for (auto& r : reactors_) {
 			Reactor* rp = r.get();
 			rp->claim_loop();
-			try { threads_.emplace_back([rp] { rp->run(); }); } catch (...) { rp->release_loop(); throw; }
+			try { threads_.emplace_back([rp] { rp->run(); rp->release_loop(); }); } catch (...) { rp->release_loop(); throw; }
 		}
 		if (shared) {
 			std::vector<Reactor*> raw;
@@ -605,9 +676,14 @@ public:
 		}
 	}
 
-	// Phase 1: abort every session (request its token), end the accept loops, let sessions finish
-	// within the grace (then force what a stalled peer holds), stop the loops and join. Idempotent.
+	// Phase 1, bounded: request every session's token and end the accept loops; sessions get the
+	// grace to finish, then force() runs on what is still tracked (each session's connection is shut
+	// down, which ends any wait on its socket) and they get the grace once more; then the loops
+	// stop and join. A session still running then (one waiting on another server's loop) is
+	// destroyed in phase 3. Idempotent.
 	void stop() {
+		if (stopped_) { return; }
+		stopped_ = true;
 		for (auto& r : reactors_) { r->abort_all(); }   // stage one: every tracked request is asked to stop
 		for (auto& control : accepts_) {
 			control->stopping.store(true);
@@ -617,27 +693,39 @@ public:
 		// socket services remain alive, then preserve the existing shutdown tail.
 		for (auto& control : accepts_) { control->wait(); }
 		// Stage two: sessions get the grace to finish; what a stalled peer still holds is forced.
-		const auto deadline = std::chrono::steady_clock::now() + grace_;
-		bool drained = true;
-		for (auto& r : reactors_) { drained = r->wait_sessions_until(deadline) && drained; }
-		if (!drained) { for (auto& r : reactors_) { r->force_all(); } }
-		for (auto& r : reactors_) { r->wait_sessions(); }
+		if (!sessions_end_within(grace_)) {
+			for (auto& r : reactors_) { r->force_all(); }
+			sessions_end_within(grace_);
+		}
 		guards_.clear();
 		for (auto& r : reactors_) { r->lag().stop(); r->io().stop(); }
-		for (auto& t : threads_) { if (t.joinable()) { t.join(); } }
-		for (std::size_t i = 0; i < threads_.size(); ++i) { reactors_[i]->release_loop(); }
+		for (auto& t : threads_) { if (t.joinable()) { t.join(); } }   // each thread releases its loop
 		threads_.clear();
 		accepts_.clear();
 	}
-	// Phase 2, after every loop a task may be suspended on has stopped: the schedulers drop
-	// what is posted to them and destroy what is spawned on them.
-	void close() { for (auto& r : reactors_) { r->scheduler().close(); } }
-	// Phase 3, with every io_context alive: destroys the tasks still suspended on the schedulers.
-	// The loops do not run again.
-	void destroy_roots() { for (auto& r : reactors_) { r->scheduler().destroy_roots(); } }
+	// Phase 2, after every loop a task may be suspended on has stopped (runs stop() if it has not
+	// run): the schedulers drop what is posted to them and destroy what is spawned on them.
+	void close() {
+		stop();
+		for (auto& r : reactors_) { r->scheduler().close(); }
+	}
+	// Phase 3, with every io_context alive (runs close() first): destroys the tasks still suspended
+	// on the schedulers. The loops do not run again.
+	void destroy_roots() {
+		close();
+		for (auto& r : reactors_) { r->scheduler().destroy_roots(); }
+	}
 
 private:
-	bool started_ = false;
+	// True when every session ended within `limit`.
+	bool sessions_end_within(std::chrono::milliseconds limit) {
+		const auto deadline = std::chrono::steady_clock::now() + limit;
+		bool drained = true;
+		for (auto& r : reactors_) { drained = r->wait_sessions_until(deadline) && drained; }
+		return drained;
+	}
+
+	bool started_ = false, stopped_ = false;
 	bool lag_probe_ = false;
 	std::vector<std::shared_ptr<detail::AcceptControl>> accepts_;
 	std::size_t n_;

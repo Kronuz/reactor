@@ -24,7 +24,24 @@ Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://gith
   `destroy_roots()`; the destructor runs any phase not yet run. `UdpServer::stop()` no longer
   destroys the suspended receive loop: `destroy_roots()` (or the destructor) does.
 - A `Reactor` destroyed with sessions still queued destroys them (a refund of their admission
-  and session count); its destructor stops the loop.
+  and session count); its destructor stops the loop, and asserts that no thread still runs it.
+- `TcpServer::stop()` is bounded. After the grace it shuts each remaining session's connection
+  down, which ends a socket wait that does not take `stop` (asio's implicit cancellation ended it
+  at `abort()` before), then gives the grace once more and stops the loops: it returns within
+  twice the grace. A session still waiting on something else (another server's loop) stays
+  suspended until `destroy_roots()`. Pass `stop` to every wait that should end at shutdown.
+- `close()` and `destroy_roots()` on `TcpServer` and `UdpServer` run the earlier phases not yet
+  run, so the phase calls are safe in any order.
+
+### Fixed
+
+- `stop()` no longer hangs when a host stopped the loop and its thread has not yet left `run()`
+  (a handler that stops the loop and throws, as `reactor_callback_failure` does): the abort walk
+  runs on the caller once the loop's thread leaves.
+- On macOS, an accept that fails with `EINVAL` on an acceptor that is no longer the bound
+  listener ends the accept loop instead of retrying it every millisecond.
+- `UdpServer::start()` stops the loop when its thread cannot start, so the receive loop it
+  spawned is destroyed by `destroy_roots()`.
 
 ### Added
 
