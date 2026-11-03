@@ -372,6 +372,11 @@ static void phases_with_external_scheduler() {
 	guard.reset(); external_io.stop(); external_thread.join();   // the owner's other loop stops too
 	server->close();
 	external->close();
+	check(server->reactor(0).scheduler().closed() && server->reactor(1).scheduler().closed() && external->closed(), "[X] close() closed every scheduler");
+	const auto before_spawn = task::detail::live_frames();
+	std::atomic<int> late_ran{0};
+	task::spawn(task::scheduler_ref::of(server->reactor(0).scheduler()), [](std::atomic<int>& ran) -> task::task<void> { ++ran; co_return; }(late_ran));
+	check(task::detail::live_frames() == before_spawn && late_ran == 0, "[X] a task spawned on a closed scheduler is destroyed unrun");
 	check(state.destroyed == 0, "[X] close() destroys nothing already suspended");
 	server->destroy_roots();
 	external->destroy_roots();
