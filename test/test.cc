@@ -5,7 +5,11 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
+#include <fcntl.h>
 #include <unistd.h>
+
+#include <csignal>
 
 #include <atomic>
 #include <chrono>
@@ -351,6 +355,24 @@ static void force_after_grace() {
 	if (fd >= 0) { ::close(fd); }
 }
 
+// [Z] ~Reactor asserts that no thread still runs its loop: destroying a claimed one aborts (in a
+// child process, before any thread starts). Debug builds only.
+static void destroy_claimed_loop_asserts() {
+#ifndef NDEBUG
+	std::fflush(stdout);
+	const pid_t child = ::fork();
+	if (child == 0) {
+		const int null = ::open("/dev/null", O_WRONLY);
+		::dup2(null, 2);   // the assertion's message
+		{ reactor::Reactor r; r.claim_loop(); }
+		std::_Exit(0);
+	}
+	int status = 0;
+	::waitpid(child, &status, 0);
+	check(WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT, "[Z] destroying a Reactor whose loop is still claimed trips its assertion");
+#endif
+}
+
 // [N] A connection that resets while queued must not end the listener (macOS reports it
 // as EINVAL from accept); a real listener failure is not retried.
 static void accept_survives_reset() {
@@ -386,6 +408,7 @@ static void accept_survives_reset() {
 int main() {
 	std::setvbuf(stdout, nullptr, _IOLBF, 0);   // a hung run still shows how far it got
 	std::printf("== reactor runtime test ==\n");
+	destroy_claimed_loop_asserts();
 
 	// [A] one reactor, many clients.
 	{
