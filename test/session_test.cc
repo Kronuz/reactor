@@ -121,7 +121,7 @@ static void never_started() {
 		Reactor r;
 		r.abort_all();   // the walk has passed (no loop claimed: inline)
 		Pair pair(r);
-		reactor::detail::launch_session(r, session, std::move(pair.server), asio::ip::tcp::endpoint{}, SessionContext{}, std::move(*admission.try_enter()));
+		reactor::detail::launch_session(reactor::detail::SessionTicket(r, std::move(*admission.try_enter())), session, std::move(pair.server), asio::ip::tcp::endpoint{}, SessionContext{});
 		check(admission.stats().active == 1, "[N] a launched session holds its admission before it runs");
 		r.io().run();
 		check(ran == 0, "[N] a session launched after the walk never runs");
@@ -132,7 +132,7 @@ static void never_started() {
 	{
 		Reactor r;
 		Pair pair(r);
-		reactor::detail::launch_session(r, session, std::move(pair.server), asio::ip::tcp::endpoint{}, SessionContext{}, std::move(*admission.try_enter()));
+		reactor::detail::launch_session(reactor::detail::SessionTicket(r, std::move(*admission.try_enter())), session, std::move(pair.server), asio::ip::tcp::endpoint{}, SessionContext{});
 		r.io().stop();
 		r.scheduler().close();
 		r.scheduler().destroy_roots();
@@ -143,9 +143,22 @@ static void never_started() {
 	{
 		auto r = std::make_unique<Reactor>();
 		Pair pair(*r);
-		reactor::detail::launch_session(*r, session, std::move(pair.server), asio::ip::tcp::endpoint{}, SessionContext{}, std::move(*admission.try_enter()));
+		reactor::detail::launch_session(reactor::detail::SessionTicket(*r, std::move(*admission.try_enter())), session, std::move(pair.server), asio::ip::tcp::endpoint{}, SessionContext{});
 		r.reset();   // ~Reactor stops the loop and the scheduler destroys the queued root
 		check(ran == 0 && admission.stats().active == 0, "[N] destroying a Reactor destroys its queued sessions and refunds");
+		::close(pair.client);
+	}
+	{
+		// Launched from another loop's thread: handed off to its own loop, never run there.
+		auto r = std::make_unique<Reactor>();
+		Pair pair(*r);
+		{
+			reactor::RunScope on_another_loop;
+			reactor::detail::launch_session(reactor::detail::SessionTicket(*r, std::move(*admission.try_enter())), session, std::move(pair.server), asio::ip::tcp::endpoint{}, SessionContext{});
+		}
+		check(admission.stats().active == 1 && !r->wait_sessions_until(std::chrono::steady_clock::now()), "[N] a session handed off to its loop is counted before it runs");
+		r.reset();   // the loop's queue is destroyed with its io_context
+		check(ran == 0 && admission.stats().active == 0, "[N] a hand-off destroyed unrun refunds its admission");
 		::close(pair.client);
 	}
 	check(task::detail::live_frames() == base, "[N] no task frame is left");
@@ -424,10 +437,10 @@ static void tokenless_waits_end_after_grace() {
 		std::atomic<int> started{0}, failed{0}, ended{0};
 		int fd = -1;
 		{
+			std::vector<char> big(write ? 64 << 20 : 0, 'x');   // filled here: a Debug fill on the loop would delay stop()
 			reactor::TcpServer server(1, 0, [&, write](asio::ip::tcp::socket socket, Reactor&, SessionContext) -> task::task<void> {
 				++started;
 				if (write) {
-					std::vector<char> big(64 << 20, 'x');
 					const auto [error, n] = co_await test::write_all(socket, asio::buffer(big));
 					if (error) { ++failed; }
 				} else {
@@ -454,6 +467,45 @@ static void tokenless_waits_end_after_grace() {
 		if (fd >= 0) { ::close(fd); }
 		check(task::detail::live_frames() == base, label + ": no task frame is left");
 	}
+}
+
+// [R] force() shuts a connection down only while the session's descriptor still names it: a
+// session that closed its socket and got the same descriptor number for another connection keeps
+// that connection through stop() (its token-less read is not ended), and phase 3 destroys it.
+static void force_spares_a_reused_descriptor() {
+	const auto base = task::detail::live_frames();
+	std::atomic<int> started{0}, reused{0}, ended{0};
+	asio::io_context other_io;
+	asio::ip::tcp::acceptor other(other_io, {asio::ip::address_v4::loopback(), 0});
+	const auto other_port = other.local_endpoint().port();
+	int fd = -1;
+	{
+		reactor::TcpServer server(1, 0, [&](asio::ip::tcp::socket socket, Reactor& r, SessionContext) -> task::task<void> {
+			const int accepted = socket.native_handle();
+			asio::error_code error;
+			socket.close(error);
+			asio::ip::tcp::socket next(r.io());
+			next.connect({asio::ip::address_v4::loopback(), other_port}, error);
+			if (!error && next.native_handle() == accepted) { ++reused; }
+			++started;
+			char byte;
+			co_await test::read_some(next, asio::buffer(&byte, 1));   // no token; the other side never sends
+			++ended;
+		});
+		reactor::BindOptions bind; bind.address = "127.0.0.1"; server.set_bind_options(bind);
+		server.set_shutdown_grace(100ms);
+		const auto port = test::free_port();
+		server.start(port);
+		fd = test::connect_port(port);
+		wait_for([&] { return started == 1; });
+		asio::ip::tcp::socket kept(other_io);
+		other.accept(kept);
+		if (reused == 0) { std::printf("     [R] the descriptor number was not reused; the case is not exercised\n"); }
+		returns_within("[R] stop()", 5000ms, [&] { server.stop(); });
+		check(reused == 0 || ended == 0, "[R] force() left the connection that reused the session's descriptor number open");
+	}
+	check(task::detail::live_frames() == base, "[R] phase 3 destroyed the session; no task frame is left");
+	if (fd >= 0) { ::close(fd); }
 }
 
 // [C] Phase 1 across servers whose session waits, with its token, on the other server's loop: stop()
@@ -575,6 +627,7 @@ int main() {
 	phases_with_external_scheduler();
 	phases_idempotent();
 	tokenless_waits_end_after_grace();
+	force_spares_a_reused_descriptor();
 	cross_server_stop_orders();
 	phase_orders();
 	std::printf("\n%s (%d failures)\n", g_fail == 0 ? "PASS" : "FAIL", g_fail);

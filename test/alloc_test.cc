@@ -1,6 +1,7 @@
 // alloc_test -- heap allocations per accepted connection: operator new calls plus the aligned_alloc
-// behind Asio's per-thread cache, with Asio's handler recycling off. The bound is the count at the
-// commit before the Session moved to task (reactor:ade618d), by the same program there.
+// behind Asio's per-thread cache, with Asio's handler recycling off (reactor_alloc) and on
+// (reactor_alloc_recycling). The bound is the count at the commit before the Session moved to task
+// (reactor:ade618d), by the same program there.
 
 #include <atomic>
 #include <cstdio>
@@ -49,12 +50,17 @@ void operator delete(void* p, std::size_t, std::align_val_t) noexcept { std::fre
 
 static int g_fail = 0;
 
-// Allocations per connection for a session that returns at once, accepted one at a time.
-static double per_connection(std::size_t reactors, bool reuse_port) {
+// Allocations per connection, accepted one at a time: a session that returns at once, or one that
+// reads a byte with its token and writes it back (the client sends one and waits for it).
+static double per_connection(std::size_t reactors, bool reuse_port, bool echo) {
 	std::atomic<unsigned> done{0};
-	reactor::TcpServer server(reactors, 0, [&done](asio::ip::tcp::socket, reactor::Reactor&, reactor::SessionContext) -> task::task<void> {
+	reactor::TcpServer server(reactors, 0, [&done, echo](asio::ip::tcp::socket socket, reactor::Reactor&, reactor::SessionContext context) -> task::task<void> {
+		if (echo) {
+			char byte;
+			const auto [error, n] = co_await test::read_some(socket, asio::buffer(&byte, 1), context.stop);
+			if (!error && n) { co_await test::write_all(socket, asio::buffer(&byte, 1)); }
+		}
 		++done;
-		co_return;
 	});
 	reactor::BindOptions bind; bind.address = "127.0.0.1"; bind.reuse_port = reuse_port;
 	server.set_bind_options(bind);
@@ -62,6 +68,7 @@ static double per_connection(std::size_t reactors, bool reuse_port) {
 	server.start(port);
 	auto connect_one = [&](unsigned expect) {
 		int fd = test::connect_port(port);
+		if (echo) { char b = 'x'; ::send(fd, &b, 1, 0); ::recv(fd, &b, 1, 0); }
 		for (int i = 0; i != 5000 && done.load() != expect; ++i) { std::this_thread::sleep_for(std::chrono::milliseconds(1)); }
 		::close(fd);
 		return done.load() == expect;
@@ -76,20 +83,39 @@ static double per_connection(std::size_t reactors, bool reuse_port) {
 }
 
 int main() {
-	struct Case { const char* name; std::size_t reactors; bool reuse_port; double head; };
-	// head: reactor:ade618d, the same program with the awaitable Session (Linux x86-64 with clang 18, macOS x86-64 with Apple clang: the same counts);
-	// a negative bound only reports.
-#if defined(__linux__) || defined(__APPLE__)
-	const double head_one = 9.0, head_shared = 7.5;
+	struct Case { const char* name; std::size_t reactors; bool reuse_port; bool echo; double head; };
+	// head: reactor:ade618d, the same sessions as asio::awaitable (alloc_head.cc; the echo is the step R
+	// review's probe_alloc_echo). The trivial counts are the same on Linux x86-64 (clang 18) and macOS
+	// x86-64; the echo counts were measured on macOS only. A negative bound only reports.
+#ifdef ASIO_DISABLE_SMALL_BLOCK_RECYCLING
+	const char* mode = "Asio recycling off";
+#  if defined(__linux__) || defined(__APPLE__)
+	const double trivial_one = 9.0, trivial_shared = 7.5;
+#  else
+	const double trivial_one = -1, trivial_shared = -1;
+#  endif
+#  if defined(__APPLE__)
+	const double echo_one = 12.0, echo_shared = 11.5;
+#  else
+	const double echo_one = -1, echo_shared = -1;
+#  endif
 #else
-	const double head_one = -1, head_shared = -1;
+	const char* mode = "Asio recycling on";
+#  if defined(__APPLE__)
+	const double trivial_one = 3.0, trivial_shared = 2.0, echo_one = 6.0, echo_shared = 6.0;
+#  else
+	const double trivial_one = -1, trivial_shared = -1, echo_one = -1, echo_shared = -1;
+#  endif
 #endif
+	std::printf("== allocations per accepted connection, %s ==\n", mode);
 	const Case cases[] = {
-		{"1 reactor, own acceptor", 1, true, head_one},
-		{"2 reactors, shared acceptor", 2, false, head_shared},
+		{"1 reactor, own acceptor, trivial session", 1, true, false, trivial_one},
+		{"2 reactors, shared acceptor, trivial session", 2, false, false, trivial_shared},
+		{"1 reactor, own acceptor, echo session", 1, true, true, echo_one},
+		{"2 reactors, shared acceptor, echo session", 2, false, true, echo_shared},
 	};
 	for (const auto& c : cases) {
-		const double got = per_connection(c.reactors, c.reuse_port);
+		const double got = per_connection(c.reactors, c.reuse_port, c.echo);
 		std::printf("  %s: %.2f allocations per accepted connection (head %.2f)\n", c.name, got, c.head);
 		const bool ok = got >= 0 && (c.head < 0 || got <= c.head);
 		std::printf("  %s %s: no more allocations per connection than head\n", ok ? "ok:  " : "FAIL:", c.name);

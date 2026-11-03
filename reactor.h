@@ -297,6 +297,9 @@ private:
 	}
 
 	AbortList aborts_;              // before io_: pending handlers die with io_, then the list
+	std::mutex session_mutex_;      // the session count, before io_: a handler io_ destroys may hold a ticket
+	std::condition_variable session_changed_;
+	std::size_t sessions_ = 0;
 	asio::io_context io_{1};
 	LagProbe lag_{io_};
 	AdmissionGate gate_;
@@ -308,25 +311,24 @@ private:
 	std::condition_variable sync_changed_;
 	std::uint64_t sync_calls_ = 0;          // under sync_call_
 	std::uint64_t sync_open_ = 0, sync_done_ = 0;   // under sync_mutex_: the call not yet taken, the last one done
-	std::mutex session_mutex_;
-	std::condition_variable session_changed_;
-	std::size_t sessions_ = 0;
 	task::asio_scheduler scheduler_{io_.get_executor()};   // last: destroyed first, while the rest is alive
 };
 
 namespace detail {
-// Pins Reactor's member order: the scheduler is destroyed first, so a root it destroys (a
-// session's control) still reaches the loop, the abortables and the session count.
+// Pins Reactor's member order. The scheduler is destroyed first, so a root it destroys (a session's
+// frame) still reaches the loop, the abortables and the session count; io_ is destroyed after the
+// session count, so a handed-off session it destroys unrun still leaves the count.
 struct ReactorLayout {
 #if defined(__GNUC__)
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Winvalid-offsetof"
 #endif
-	static constexpr std::size_t scheduler = offsetof(Reactor, scheduler_);
-	static_assert(scheduler > offsetof(Reactor, io_) && scheduler > offsetof(Reactor, aborts_) &&
-		scheduler > offsetof(Reactor, gate_) && scheduler > offsetof(Reactor, session_mutex_) &&
-		scheduler > offsetof(Reactor, session_changed_) && scheduler > offsetof(Reactor, sessions_),
-		"Reactor::scheduler_ must be declared after what its roots reach");
+	static constexpr std::size_t scheduler = offsetof(Reactor, scheduler_), io = offsetof(Reactor, io_);
+	static_assert(scheduler > io && scheduler > offsetof(Reactor, aborts_) && scheduler > offsetof(Reactor, gate_) &&
+		scheduler > offsetof(Reactor, lag_), "Reactor::scheduler_ must be declared after what its roots reach");
+	static_assert(io > offsetof(Reactor, aborts_) && io > offsetof(Reactor, session_mutex_) &&
+		io > offsetof(Reactor, session_changed_) && io > offsetof(Reactor, sessions_),
+		"Reactor::io_ must be declared after what the handlers it destroys reach");
 #if defined(__GNUC__)
 #pragma GCC diagnostic pop
 #endif
@@ -354,17 +356,26 @@ inline void shutdown_connection(int descriptor, const asio::ip::tcp::endpoint& p
 	if (current == peer) { ::shutdown(descriptor, SHUT_RDWR); }
 }
 
-// Shutdown retains each session until its spawn's completion runs (or its root is destroyed).
-struct SessionControl : Abortable {
-	SessionControl(Reactor& owner, ConnectionAdmission::Lease admitted, int fd, const asio::ip::tcp::endpoint& from)
-		: reactor(owner), admission(std::move(admitted)), descriptor(fd), peer(from) { reactor.session_started(); }
-	~SessionControl() { finish(); }
-	Reactor& reactor;
+// A session's place in its reactor's session count and its admission, from the accept until its
+// frame ends or is destroyed unrun, so stop() waits for it and its admission is refunded either way.
+struct SessionTicket {
+	SessionTicket(Reactor& owner, ConnectionAdmission::Lease admitted) : reactor(&owner), admission(std::move(admitted)) {
+		owner.session_started();
+	}
+	SessionTicket(SessionTicket&& other) noexcept : reactor(std::exchange(other.reactor, nullptr)), admission(std::move(other.admission)) {}
+	SessionTicket& operator=(SessionTicket&&) = delete;
+	~SessionTicket() {
+		if (reactor) { admission.reset(); reactor->session_finished(); }
+	}
+	Reactor* reactor;
 	ConnectionAdmission::Lease admission;
+};
+// What shutdown reaches of a running session: its token (abort()) and its connection (force()).
+struct SessionControl : Abortable {
+	SessionControl(int fd, const asio::ip::tcp::endpoint& from) : descriptor(fd), peer(from) {}
 	task::cancel_source stop;
-	const int descriptor;                    // the accepted connection, for force()
+	const int descriptor;
 	const asio::ip::tcp::endpoint peer;
-	std::atomic<bool> finished{false};
 	std::atomic<bool> aborted{false};
 	// On the loop (a late track() aborts there too), or on the caller when no loop is claimed.
 	void abort() override {
@@ -373,29 +384,35 @@ struct SessionControl : Abortable {
 	}
 	// After the grace: the connection is shut down, so a wait that does not take the token ends.
 	void force() override { shutdown_connection(descriptor, peer); }
-	void finish() {
-		if (!finished.exchange(true)) { reactor.untrack(*this); admission.reset(); reactor.session_finished(); }
-	}
 };
-// Runs on the destination loop: registers the control, then the session as a child.
-inline task::task<void> run_session(std::shared_ptr<SessionControl> control, const Session* session,
-	asio::ip::tcp::socket socket, SessionContext context) {
-	Reactor& reactor = control->reactor;
-	reactor.track(*control);
-	if (control->aborted.load()) { asio::error_code error; socket.close(error); co_return; }
+// Runs on the session's loop: tracks the control (its destructor untracks it), then awaits the
+// session as a child. The frame holds the ticket and the control, so a session allocates nothing
+// beyond its frames.
+inline task::task<void> run_session(SessionTicket ticket, const Session* session, asio::ip::tcp::socket socket,
+	asio::ip::tcp::endpoint peer, SessionContext context) {
+	Reactor& reactor = *ticket.reactor;
+	SessionControl control(socket.native_handle(), peer);
+	reactor.track(control);
+	if (control.aborted.load()) { asio::error_code error; socket.close(error); co_return; }
+	context.stop = control.stop.token();
 	co_await (*session)(std::move(socket), reactor, std::move(context));
 }
-// The control is counted before spawning, so the accept barrier covers it.
-inline void launch_session(Reactor& reactor, const Session& session, asio::ip::tcp::socket socket,
-	const asio::ip::tcp::endpoint& peer, SessionContext context, ConnectionAdmission::Lease admission) {
-	auto control = std::make_shared<SessionControl>(reactor, std::move(admission), socket.native_handle(), peer);
+// Spawns the session on its reactor's scheduler. From another reactor's loop (the shared acceptor)
+// it posts the launch to the session's own loop first, so its frames come from that thread's frame
+// pool, which their release refills. The ticket is taken before either, so the accept barrier covers it.
+inline void launch_session(SessionTicket ticket, const Session& session, asio::ip::tcp::socket socket,
+	const asio::ip::tcp::endpoint& peer, SessionContext context) {
+	Reactor& reactor = *ticket.reactor;
+	if (inside_run() && !reactor.on_loop()) {
+		asio::post(reactor.io(), [ticket = std::move(ticket), &session, socket = std::move(socket), peer, context = std::move(context)]() mutable {
+			try { launch_session(std::move(ticket), session, std::move(socket), peer, std::move(context)); }
+			catch (const std::bad_alloc&) {}   // the connection is dropped; its ticket and socket are released
+		});
+		return;
+	}
 	reactor.lag().note_activity();
-	context.stop = control->stop.token();
-	try {
-		task::spawn(task::scheduler_ref::of(reactor.scheduler()),
-			run_session(control, &session, std::move(socket), std::move(context)),
-			[control](std::exception_ptr) { control->finish(); });
-	} catch (...) { control->finish(); throw; }
+	task::spawn(task::scheduler_ref::of(reactor.scheduler()),
+		run_session(std::move(ticket), &session, std::move(socket), peer, std::move(context)), [](std::exception_ptr) {});
 }
 
 // Accept-loop completion is the retirement barrier for cross-reactor peer sockets.
@@ -529,7 +546,7 @@ inline task::task<void> accept_loop(Reactor* reactor, const Session* session,
 		std::optional<ConnectionAdmission::Lease> lease;
 		if (admission) { lease = admission->try_enter(); if (!lease) { continue; } }
 		bool pressure = false;
-		try { launch_session(*reactor, *session, std::move(socket), peer, std::move(context), lease ? std::move(*lease) : ConnectionAdmission::Lease{}); }
+		try { launch_session(SessionTicket(*reactor, lease ? std::move(*lease) : ConnectionAdmission::Lease{}), *session, std::move(socket), peer, std::move(context)); }
 		catch (const std::bad_alloc&) { pressure = true; }
 		if (pressure && !(co_await control->retry(asio::error::no_memory))) { co_return; }
 	}
@@ -571,7 +588,7 @@ inline task::task<void> shared_accept_loop(std::vector<Reactor*> reactors, const
 		std::optional<ConnectionAdmission::Lease> lease;
 		if (admission) { lease = admission->try_enter(); if (!lease) { continue; } }
 		bool pressure = false;
-		try { launch_session(*r, *session, std::move(socket), peer, std::move(context), lease ? std::move(*lease) : ConnectionAdmission::Lease{}); }
+		try { launch_session(SessionTicket(*r, lease ? std::move(*lease) : ConnectionAdmission::Lease{}), *session, std::move(socket), peer, std::move(context)); }
 		catch (const std::bad_alloc&) { pressure = true; }
 		if (pressure && !(co_await control->retry(asio::error::no_memory))) { co_return; }
 	}
