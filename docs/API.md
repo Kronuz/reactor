@@ -1,5 +1,47 @@
 # reactor API reference
 
+## A Session is a task
+
+```cpp
+struct SessionContext { std::chrono::steady_clock::time_point accepted_at; task::cancel_token stop; };
+using Session = std::function<task::task<void>(asio::ip::tcp::socket, Reactor&, SessionContext)>;
+TcpServer(std::size_t reactors, int admission_limit, Session session, std::size_t maximum_connections = 0);
+```
+
+One `Session` type and one constructor (`maximum_connections` is the optional bound on live
+connections, 0 for none). `accepted_at` is the accept-completion time. `stop` is requested with
+`task::cancel_reason::shutdown` when the server stops; a session has no other implicit
+cancellation, and chooses which operations take it:
+
+```cpp
+auto [error, n] = co_await task::await_asio<void(asio::error_code, std::size_t)>(
+    [&](auto handler) { socket.async_read_some(asio::buffer(buf), std::move(handler)); }, context.stop);
+```
+
+A read that takes the token ends with `operation_aborted` (immediately, without starting, when
+the token was requested before it began) and the session finishes normally; one that does not
+take it runs until it completes or `force()` closes the socket after the grace. An exception
+that escapes the session (including `task::cancelled`) ends the connection and is dropped.
+
+Each `Reactor` owns one `task::asio_scheduler`, `reactor(i).scheduler()`, for its loop. The
+session, the accept loops and `UdpServer`'s receive loop are tasks spawned on it, and a host may
+spawn its own there. Link `task::asio` (the CMake target `reactor` does).
+
+### Teardown: task's four phases
+
+`TcpServer` and `UdpServer` expose them as calls, each idempotent:
+
+1. `stop()`: sessions' tokens are requested, accepts end, sessions get the grace, the loops stop
+   and their threads join.
+2. `close()`: the schedulers drop what is posted to them and destroy what is spawned on them.
+3. `destroy_roots()`: the tasks still suspended are destroyed, with every `io_context` alive.
+4. Destruction: each scheduler, then its loop.
+
+The destructor runs every phase not yet run, which suffices when nothing else outlives the
+server. A process with several servers, pools or loops that tasks may be suspended on (a task on
+one server's scheduler may wait on another's timer) runs each phase on all of them before the
+next; the `io_context` is not run again after phase 3.
+
 ## What it gives a Session
 
 - **N shared-nothing reactors on N threads.** Thread-per-core: no shared state
@@ -12,7 +54,8 @@
   `admission_limit` requests in flight, so overload is refused (an HTTP 503) instead of
   queued. A limit of 0 admits everything and still counts. There is no worker pool:
   work that must wait suspends its coroutine.
-- **A clean shutdown.** Register anything a request can wait on as an `Abortable`
+- **A clean shutdown.** A session takes `SessionContext::stop` on the waits it wants ended, and
+  registers anything else a request can wait on as an `Abortable`
   (`Reactor::track(a)`, with `untrack(a)` when it is done). The hooks are intrusive, so
   tracking allocates nothing and costs O(1), and they are touched on the reactor's own
   loop only. `stop()` runs `abort()` on each (on its loop) before stopping the loops: a

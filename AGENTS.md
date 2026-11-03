@@ -7,7 +7,7 @@ Orientation for anyone (human or agent) working on this library.
 A generic Asio **server runtime** on standalone Asio (C++20 coroutines): the
 shared-nothing reactor pool + accept plumbing + graceful shutdown that every network
 protocol needs, with the protocol left entirely to the caller. For TCP you provide a
-`Session` coroutine that serves one connection; for connectionless UDP you provide a
+`Session` task (a `task::task<void>`) that serves one connection; for connectionless UDP you provide a
 `Datagram` handler called per packet. The runtime owns the loops, the threads, the
 acceptor/socket, per-reactor admission, and the shutdown. Header-only. Read `README.md` and `docs/API.md` for
 the shape, `ARCHITECTURE.md` for how a connection flows; this is the working notes.
@@ -62,10 +62,16 @@ docs/reactor.d2      The README and ARCHITECTURE diagram's source (docs/reactor.
 
 ## The API surface
 
-- **`TcpServer(reactors, admission_limit, session)`** — N reactors on N threads, each
-  with an `AdmissionGate` of `admission_limit` requests in flight (0 => no cap).
+- **`TcpServer(reactors, admission_limit, session, maximum_connections = 0)`** — N reactors on
+  N threads, each with an `AdmissionGate` of `admission_limit` requests in flight (0 => no cap).
   `set_bind_options()`, `set_shutdown_grace()` (5 s by default), `start(port)` (binds,
-  runs, returns), `stop()` (abort → grace → force → stop → join; also the destructor).
+  runs, returns). Teardown is task's four phases as calls: `stop()` (request every session's
+  token → grace → force → stop → join), `close()` (close the reactors' schedulers),
+  `destroy_roots()` (destroy the tasks still suspended), then destruction. The destructor runs
+  any phase not yet run; a process with several servers or loops runs each phase on all of them
+  before the next. `UdpServer` has the same three calls.
+- **`Reactor::scheduler()`** — the loop's `task::asio_scheduler`; sessions, accept loops and the
+  UDP receive loop are spawned on it, and tasks of the host can be too.
 - **`UdpServer(on_datagram)`** — one reactor + one bound UDP
   socket. `set_options(UdpOptions)`, `start(port)` (binds/joins — THROWS on failure —
   then runs the receive loop), `send(data)` / `send_to(data, endpoint)`, `stop()`.
@@ -74,8 +80,10 @@ docs/reactor.d2      The README and ARCHITECTURE diagram's source (docs/reactor.
 - **`Reactor`** — one reactor. `io()`, `gate()`, `track(Abortable&)`/`untrack(Abortable&)`
   (on the loop; O(1)), `abort_all()`, `force_all()`, `stopping()`, `claim_loop()`/
   `release_loop()` (a host driving a loop on its own thread).
-- **`Session = function<awaitable<void>(tcp::socket, Reactor&)>`** — you write this.
-  The whole TCP protocol.
+- **`Session = function<task::task<void>(tcp::socket, Reactor&, SessionContext)>`** — you write
+  this: the whole TCP protocol. `SessionContext` holds `accepted_at` and `stop`, the session's
+  `task::cancel_token`, requested with `cancel_reason::shutdown` at shutdown. The session
+  chooses which operations take it (`task::await_asio(init, context.stop)`).
 - **`Datagram = function<void(string_view, const udp::endpoint&)>`** — the UDP handler,
   called per received datagram on the reactor thread. The wire framing is yours.
 - **`Abortable { abort(); force(); }`** — register with `Reactor::track(a)`, remove with
@@ -98,7 +106,7 @@ docs/reactor.d2      The README and ARCHITECTURE diagram's source (docs/reactor.
   waits, or `stop()` will hang. `abort()` releases the wait; `force()` releases the
   socket a stalled peer holds. Track and untrack on the reactor's loop only: the list is
   intrusive and unlocked, and `abort_all()` posts its walk to that loop.
-- **Shutdown order is abort → close and reap accepts → grace → force → wait for sessions → clear guards → stop → join.** Don't reorder;
+- **Shutdown order is abort → close and reap accepts → grace → force → wait for sessions → clear guards → stop → join** (`stop()`), then `close()`, then `destroy_roots()`. Don't reorder;
   each step depends on the previous. See `TcpServer::stop()`.
 - **The shared-acceptor path needs the work guards.** Idle reactors' `run()` returns
   immediately without them. Don't remove the `make_work_guard` loop.
@@ -161,7 +169,7 @@ TCP `start(port)` now waits for every selected acceptor to bind and listen. Bind
 
 TCP connection admission now has an optional global bound set with `set_connection_limit(maximum)` before startup; zero keeps the existing unlimited behavior. A move-only lease is acquired on the accepting executor before posting a session to its destination, and original session retirement refunds it exactly once. `connection_stats()` reports active leases, high-water occupancy and saturating accepted/rejected counters. The bound covers queued and running sessions; at most one extra socket per active acceptor can be in an accept completion before admission, in addition to the kernel listen backlog. No protocol allocation or rejection reply is needed for excess sockets.
 
-The existing Session and four-argument TcpServer constructor remain available. An additive `TimedSession(socket, Reactor&, SessionContext)` constructor takes an explicit fifth connection-bound argument; `SessionContext::accepted_at` carries the accept-completion timestamp so protocol deadlines can include destination queue time. Shutdown retains the lease through original serving IO. The blocked-destination and shared/reuse-port flood tests qualify queued admission and exact refunds.
+There is one `Session` type, `task::task<void>(socket, Reactor&, SessionContext)`, and one constructor, `TcpServer(reactors, admission_limit, session, maximum_connections = 0)`; `Session` over `asio::awaitable`, `TimedSession` and the two earlier constructors are gone. `SessionContext::accepted_at` carries the accept-completion timestamp so protocol deadlines can include destination queue time. Shutdown retains the lease through original serving IO. The blocked-destination and shared/reuse-port flood tests qualify queued admission and exact refunds.
 
 ## Callback exception contract
 

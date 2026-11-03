@@ -23,7 +23,7 @@ mechanics — loops, threads, acceptors/sockets, admission, shutdown. Nothing he
 wire format.
 
 ```
-      protocol:  Session = awaitable<void>(socket, Reactor&)    -- TCP: you write this
+      protocol:  Session = task<void>(socket, Reactor&, SessionContext) -- TCP: you write this
                  Datagram = void(string_view, udp::endpoint)    -- UDP: you write this
      ------------------------------ the seam --------------------------------
   runtime   TcpServer     N reactors on N threads, one port, a Session per connection
@@ -92,7 +92,7 @@ thread falling through and exiting before the first connection is ever routed to
 ```
   client connects
       -> acceptor accepts (per-reactor, or shared -> round-robin onto reactor r)
-      -> co_spawn( session(socket, r) )  on r's io_context, detached
+      -> task::spawn( session(socket, r, {accepted_at, stop}) )  on r's scheduler
       -> your Session coroutine runs the whole connection:
              read bytes ... co_await whatever it must wait for ... write ...
              keep-alive loop ... co_return on EOF/close
@@ -141,6 +141,14 @@ resource a write is blocked on. The bound is therefore the grace
 that ignores `abort()` and holds no socket `force()` can close waits for as long as it
 runs.
 
+`stop()` is the first of task's four teardown phases. `close()` closes every reactor's
+`task::asio_scheduler` (what is posted to it is dropped, what is spawned on it is destroyed
+unrun), and `destroy_roots()` destroys the tasks still suspended on them, with every
+`io_context` alive; then the destructors destroy each scheduler and its loop. Each phase is
+idempotent and the destructor runs any not yet run. A process with several servers, pools or
+loops that tasks may be suspended on runs each phase on all of them before the next: a task
+on one server's scheduler may sit on another's timer, and destroying it needs both alive.
+
 The list is intrusive (two pointers in the `Abortable`), so `track` and `untrack` are
 O(1) with no allocation and no lock, and are made on the reactor's loop. `abort_all()`
 and `force_all()` called from another thread post their walk to the loop and return
@@ -161,12 +169,14 @@ going out of scope tears down cleanly on its own.
         if multicast:  enable_loopback, ttl, outbound_interface (IP_MULTICAST_IF)
         bind(port)                 -- THROWS on failure (the app decides what that means)
         if multicast:  join_group(group[, interface])   -- and remember group:port for send()
-        co_spawn(receive_loop)     -- async_receive_from -> on_datagram(bytes, from), forever;
+        spawn(receive_loop)        -- async_receive_from -> on_datagram(bytes, from), forever;
                                       a handler throw goes to L_EXC and the loop continues
         run() on the thread
       send(data)      -> send_to(data, group:port)
       send_to(d, ep)  -> one datagram to ep
       stop()          -> abort_all -> io.stop() -> join  (same order as TCP)
+      close()         -> the scheduler drops what is posted to it
+      destroy_roots() -> the suspended receive loop is destroyed
 ```
 
 Two things are load-bearing and specific to UDP:
@@ -197,7 +207,7 @@ TCP `start(port)` now waits for every selected acceptor to bind and listen. Bind
 
 TCP connection admission now has an optional global bound set with `set_connection_limit(maximum)` before startup; zero keeps the existing unlimited behavior. A move-only lease is acquired on the accepting executor before posting a session to its destination, and original session retirement refunds it exactly once. `connection_stats()` reports active leases, high-water occupancy and saturating accepted/rejected counters. The bound covers queued and running sessions; at most one extra socket per active acceptor can be in an accept completion before admission, in addition to the kernel listen backlog. No protocol allocation or rejection reply is needed for excess sockets.
 
-The existing Session and four-argument TcpServer constructor remain available. An additive `TimedSession(socket, Reactor&, SessionContext)` constructor takes an explicit fifth connection-bound argument; `SessionContext::accepted_at` carries the accept-completion timestamp so protocol deadlines can include destination queue time. Shutdown retains the lease through original serving IO. The blocked-destination and shared/reuse-port flood tests qualify queued admission and exact refunds.
+There is one `Session` type and one constructor, `TcpServer(reactors, admission_limit, session, maximum_connections = 0)`; `SessionContext::accepted_at` carries the accept-completion timestamp so protocol deadlines can include destination queue time. Shutdown retains the lease through original serving IO. The blocked-destination and shared/reuse-port flood tests qualify queued admission and exact refunds.
 
 ## Callback exceptions on the UDP owner loop
 

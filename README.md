@@ -42,14 +42,16 @@ An echo server on four reactors:
 
 #include <cstdio>
 
-asio::awaitable<void> echo(asio::ip::tcp::socket socket, reactor::Reactor&) {
+// context.stop is requested at shutdown; the read that takes it ends then.
+task::task<void> echo(asio::ip::tcp::socket socket, reactor::Reactor&, reactor::SessionContext context) {
 	char buf[1024];
-	try {
-		for (;;) {
-			std::size_t n = co_await socket.async_read_some(asio::buffer(buf), asio::use_awaitable);
-			co_await asio::async_write(socket, asio::buffer(buf, n), asio::use_awaitable);
-		}
-	} catch (const std::exception&) {}  // the peer closed
+	for (;;) {
+		auto [error, n] = co_await task::await_asio<void(asio::error_code, std::size_t)>(
+			[&](auto handler) { socket.async_read_some(asio::buffer(buf), std::move(handler)); }, context.stop);
+		if (error) { co_return; }  // the peer closed, or shutdown
+		co_await task::await_asio<void(asio::error_code, std::size_t)>(
+			[&](auto handler) { asio::async_write(socket, asio::buffer(buf, n), std::move(handler)); });
+	}
 }
 
 int main() {
