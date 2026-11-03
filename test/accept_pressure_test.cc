@@ -101,6 +101,25 @@ void qualify_retry_cancel() {
 	check(retried.has_value() && !*retried);
 	check(std::chrono::steady_clock::now() - began < std::chrono::milliseconds(500));
 }
+// Reset connections queued in the backlog (macOS reports each as an accept error) must drain
+// without the growing pause a resource error gets.
+void qualify_reset_backlog() {
+	asio::io_context io;
+	task::asio_scheduler scheduler(io.get_executor());
+	auto control = std::make_shared<reactor::detail::AcceptControl>(io);
+	const auto began = std::chrono::steady_clock::now();
+	unsigned continued = 0;
+	task::spawn(task::scheduler_ref::of(scheduler),
+		[](std::shared_ptr<reactor::detail::AcceptControl> control, unsigned &continued) -> task::task<void> {
+			for (unsigned i = 0; i != 64 + 8; ++i) {
+				if (co_await control->retry(asio::error::connection_aborted)) { ++continued; }
+			}
+		}(control, continued));
+	io.run();
+	check(continued == 72);
+	check(std::chrono::steady_clock::now() - began < std::chrono::milliseconds(500));
+	check(control->retry_delay == std::chrono::milliseconds(10));
+}
 void qualify(bool reuse_port) {
 	const auto port = unused_port();
 	Socket first, second;
@@ -147,6 +166,7 @@ int main() {
 	std::signal(SIGPIPE, SIG_IGN);
 	try {
 		qualify_retry_cancel();
+		qualify_reset_backlog();
 		qualify(false);
 #ifdef __linux__
 		qualify(true);

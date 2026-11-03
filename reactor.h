@@ -372,15 +372,23 @@ struct AcceptControl {
 	std::unique_ptr<asio::ip::tcp::acceptor> acceptor;
 	asio::steady_timer retry_timer;
 	std::chrono::milliseconds retry_delay{10};
-	// Consecutive per-connection errors skipped without a pause; a listener that only ever
-	// fails this way backs off like a resource error instead of spinning.
+	// Consecutive per-connection errors skipped without a pause; past 64 each pauses 1 ms, so a
+	// listener that only ever fails this way does not spin.
 	unsigned skipped = 0;
 	task::task<bool> retry(asio::error_code error) {
 		if (stopping.load()) { co_return false; }
-		if (per_connection_accept_error(error) && ++skipped <= 64) { co_return true; }
-		if (!per_connection_accept_error(error) && !retryable_accept_error(error)) { throw asio::system_error(error); }
-		retry_timer.expires_after(retry_delay);
-		retry_delay = std::min(retry_delay * 2, std::chrono::milliseconds(1000));
+		const bool per_connection = per_connection_accept_error(error);
+		if (per_connection && ++skipped <= 64) { co_return true; }
+		if (!per_connection && !retryable_accept_error(error)) { throw asio::system_error(error); }
+		// Past the free skips a per-connection error pauses a flat 1 ms: a backlog of reset
+		// connections drains, and a listener that only fails this way does not spin. A resource
+		// error backs off with growing delay.
+		auto delay = std::chrono::milliseconds(1);
+		if (!per_connection) {
+			delay = retry_delay;
+			retry_delay = std::min(retry_delay * 2, std::chrono::milliseconds(1000));
+		}
+		retry_timer.expires_after(delay);
 		const auto timer_error = co_await task::await_asio<void(asio::error_code)>(
 			[this](auto handler) { retry_timer.async_wait(std::move(handler)); });
 		co_return !timer_error && !stopping.load();
