@@ -33,7 +33,7 @@ endif()
 # --- task (cancellable coroutines; the Session type and the loops' scheduler) ---
 # The one place the pin lives: task main after step C3 (task:6558c2e, inline resume of top-level completions).
 # Set FETCHCONTENT_SOURCE_DIR_TASK to build against a local checkout instead.
-FetchContent_Declare(task GIT_REPOSITORY https://github.com/Kronuz/task.git GIT_TAG 6558c2e9c533ebb0fa1177f22edd4fff528f6efa)
+FetchContent_Declare(task GIT_REPOSITORY https://github.com/Kronuz/task.git GIT_TAG bdafa5f1ca96a2d34b1c5eb0bbb04e4b3ddb88c0)
 FetchContent_MakeAvailable(task)
 
 # --- the reactor runtime (header-only) ---
