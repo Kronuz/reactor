@@ -1,0 +1,58 @@
+-- Configuring done (0.1s)
+-- Generating done (0.1s)
+-- Build files have been written to: /Users/kronuz/code/Kronuz/reactor-wt/l3-http/build-asan
+[ 13%] Building CXX object CMakeFiles/reactor_accept_pressure_test.dir/test/accept_pressure_test.cc.o
+[ 13%] Building CXX object CMakeFiles/reactor_echo_server.dir/examples/echo_server.cc.o
+[ 13%] Building CXX object CMakeFiles/reactor_echo_bench.dir/benchmarks/echo_bench.cc.o
+[ 18%] Linking CXX executable reactor_echo_server
+[ 22%] Linking CXX executable reactor_echo_bench
+[ 22%] Built target reactor_echo_server
+[ 31%] Built target reactor_tls_test
+[ 36%] Building CXX object CMakeFiles/reactor_test.dir/test/test.cc.o
+[ 36%] Built target reactor_echo_bench
+[ 40%] Building CXX object CMakeFiles/reactor_udp_test.dir/test/udp_test.cc.o
+[ 45%] Linking CXX executable reactor_accept_pressure_test
+[ 45%] Built target reactor_accept_pressure_test
+[ 50%] Building CXX object CMakeFiles/reactor_udp_seam_default_test.dir/test/udp_seam_test.cc.o
+[ 54%] Linking CXX executable reactor_udp_seam_default_test
+[ 54%] Built target reactor_udp_seam_default_test
+[ 59%] Linking CXX executable reactor_udp_test
+[ 63%] Building CXX object CMakeFiles/reactor_udp_seam_header_test.dir/test/udp_seam_test.cc.o
+[ 63%] Built target reactor_udp_test
+[ 68%] Building CXX object CMakeFiles/reactor_callback_failure_test.dir/test/callback_failure_test.cc.o
+[ 72%] Linking CXX executable reactor_test
+[ 72%] Built target reactor_test
+[ 77%] Building CXX object CMakeFiles/reactor_events_test.dir/test/events_test.cc.o
+[ 81%] Linking CXX executable reactor_udp_seam_header_test
+[ 81%] Built target reactor_udp_seam_header_test
+[ 86%] Building CXX object CMakeFiles/reactor_lag_test.dir/test/lag_test.cc.o
+[ 90%] Linking CXX executable reactor_callback_failure_test
+[ 90%] Built target reactor_callback_failure_test
+[ 95%] Linking CXX executable reactor_events_test
+[ 95%] Built target reactor_events_test
+[100%] Linking CXX executable reactor_lag_test
+[100%] Built target reactor_lag_test
+Test project /Users/kronuz/code/Kronuz/reactor-wt/l3-http/build-asan
+    Start 1: reactor_accept_pressure
+1/9 Test #1: reactor_accept_pressure ..........   Passed    2.12 sec
+    Start 2: reactor_tls
+2/9 Test #2: reactor_tls ......................   Passed    0.29 sec
+    Start 3: reactor
+3/9 Test #3: reactor ..........................   Passed    1.94 sec
+    Start 4: reactor_udp
+4/9 Test #4: reactor_udp ......................   Passed    1.04 sec
+    Start 5: reactor_udp_seam_default
+5/9 Test #5: reactor_udp_seam_default .........   Passed    0.34 sec
+    Start 6: reactor_udp_seam_header
+6/9 Test #6: reactor_udp_seam_header ..........   Passed    0.34 sec
+    Start 7: reactor_callback_failure
+7/9 Test #7: reactor_callback_failure .........   Passed    0.30 sec
+    Start 8: reactor_events
+8/9 Test #8: reactor_events ...................   Passed    0.97 sec
+    Start 9: reactor_lag
+9/9 Test #9: reactor_lag ......................   Passed    7.96 sec
+
+100% tests passed out of 9
+
+Total Test time (real) =  15.31 sec
+exit=0
