@@ -1,7 +1,8 @@
 // lag_test -- validates reactor::LagProbe: the bucket arithmetic, that a handler holding the loop
 // shows up in the right bucket, that a started probe allocates nothing, that an idle loop wakes
 // 10 times a second and a busy one about 1,000, that stop() ends the wakes, and that a TcpServer
-// runs a probe on every reactor.
+// runs a probe on every reactor, and, on a manual clock, that a wake's lateness is read against the
+// whole tick the loop's timer was set for.
 
 #include <atomic>
 #include <chrono>
@@ -104,7 +105,8 @@ int main() {
 	// [B] a handler that holds the loop 6 ms makes a wake at least 4,096 us late.
 	{
 		asio::io_context io{1};
-		reactor::LagProbe probe(io);
+		task::asio_scheduler scheduler(io.get_executor());
+		reactor::LagProbe probe(task::scheduler_ref::of(scheduler));
 		auto guard = asio::make_work_guard(io);
 		probe.start();
 		std::thread th([&io] { reactor::RunScope scope; io.run(); });
@@ -125,29 +127,28 @@ int main() {
 		th.join();
 	}
 
-	// [C] a started probe allocates nothing on the loop thread, from its first wake on, busy or idle.
+	// [C] a started probe allocates nothing on the loop thread, busy or idle: its entry lives in the
+	// probe, and the loop's one Asio timer reuses asio's own operation cache after its first wakes.
 	{
 		asio::io_context io{1};
-		reactor::LagProbe probe(io);
+		task::asio_scheduler scheduler(io.get_executor());
+		reactor::LagProbe probe(task::scheduler_ref::of(scheduler));
 		auto guard = asio::make_work_guard(io);
 		probe.start();
 		g_allocations = 0;
-		std::thread th([&io] {
-			counting = true;
-			io.run();
-			counting = false;
-		});
+		std::thread th([&io] { io.run(); });
 		probe.note_activity();
-		const auto wakes = wakes_in(probe, 400ms);
+		const auto wakes = wakes_in(probe, 400ms);   // warms the cache
+		on_loop(io, [] { counting = true; });
 		for (int i = 0; i < 40; ++i) { probe.note_activity(); std::this_thread::sleep_for(10ms); }
 		std::this_thread::sleep_for(300ms);
 		probe.stop();
-		on_loop(io, [] {});
+		on_loop(io, [] { counting = false; });
 		const auto allocated = g_allocations.load();
-		std::printf("     %llu wakes in 400 ms, %llu allocations on the loop thread\n", (unsigned long long)wakes, (unsigned long long)allocated);
+		std::printf("     %llu wakes in 400 ms, %llu allocations on the loop thread after them\n", (unsigned long long)wakes, (unsigned long long)allocated);
 		check(wakes >= 50, "the probe was waking during the window");
 		if (LAG_TEST_COUNT_ALLOCATIONS) {
-			check(allocated == 0, "zero allocations on the loop thread after start()");
+			check(allocated == 0, "zero allocations on the loop thread once the cache is warm");
 		} else {
 			std::printf("  skip: allocation count (the TSan runtime owns operator new)\n");
 		}
@@ -158,7 +159,8 @@ int main() {
 	// [D] busy wakes at ~1 ms; after 1 s idle they drop to ~10 a second.
 	{
 		asio::io_context io{1};
-		reactor::LagProbe probe(io);
+		task::asio_scheduler scheduler(io.get_executor());
+		reactor::LagProbe probe(task::scheduler_ref::of(scheduler));
 		auto guard = asio::make_work_guard(io);
 		probe.start();
 		std::thread th([&io] { io.run(); });
@@ -178,6 +180,37 @@ int main() {
 		check(probe.snapshot().wakes == stopped, "stop() ends the wakes");
 		guard.reset();
 		th.join();
+	}
+
+	// [F] on a manual clock the wake aims at a whole tick: 700 us past it reads as 700 us, a wake
+	// before it as none, and the next wake is an interval after the clock, floored to a tick.
+	{
+		task::inline_scheduler clock;
+		reactor::LagProbe probe(task::scheduler_ref::of(clock));
+		constexpr std::uint64_t ms = 1'000'000, us = 1'000;
+		probe.start();
+		clock.advance(100 * ms - ms / 2);
+		check(probe.snapshot().wakes == 0, "the idle wake, aimed at 100 ms, has not run at 99.5 ms");
+		clock.advance(ms / 2 + 700 * us);
+		auto snap = probe.snapshot();
+		check(snap.wakes == 1 && snap.max_us == 700 && snap.sum_us == 700, "a wake 700 us past its tick records 700 us");
+		check(snap.quantile_upper_us(1.0) == S::upper_us(S::index_of(700)), "700 us is in its bucket");
+		clock.advance(99 * ms);
+		check(probe.snapshot().wakes == 1, "the next wake, aimed at 200 ms, has not run at 199.7 ms");
+		clock.advance(ms / 2);
+		snap = probe.snapshot();
+		check(snap.wakes == 2 && snap.max_us == 700 && snap.sum_us == 900, "a wake 200 us past its tick records 200 us");
+		probe.note_activity();
+		clock.advance(100 * ms);   // the 300 ms wake sees the activity and goes to 1 ms
+		const auto before = probe.snapshot().wakes;
+		for (int i = 0; i < 10; ++i) { clock.advance(ms); }
+		const auto busy = probe.snapshot().wakes - before;
+		std::printf("     busy: %llu wakes in 10 manual ms\n", (unsigned long long)busy);
+		check(busy == 10, "busy, the manual clock wakes the probe once a millisecond");
+		probe.stop();
+		clock.advance(10 * ms);
+		check(probe.snapshot().wakes == before + busy, "stop() ends the manual wakes");
+		check(clock.armed_timers() == 0, "no entry is left on the wheel");
 	}
 
 	// [E] a TcpServer with the probe on runs one per reactor; without it nothing runs.

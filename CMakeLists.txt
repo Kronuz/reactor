@@ -31,9 +31,9 @@ if(ASIO_INCLUDE_DIR STREQUAL "")
 endif()
 
 # --- task (cancellable coroutines; the Session type and the loops' scheduler) ---
-# The one place the pin lives: task main after step C3 (task:6558c2e, inline resume of top-level completions).
+# The one place the pin lives: task main with its timers on Kronuz/wheel (task:0e71a38).
 # Set FETCHCONTENT_SOURCE_DIR_TASK to build against a local checkout instead.
-FetchContent_Declare(task GIT_REPOSITORY https://github.com/Kronuz/task.git GIT_TAG bdafa5f1ca96a2d34b1c5eb0bbb04e4b3ddb88c0)
+FetchContent_Declare(task GIT_REPOSITORY https://github.com/Kronuz/task.git GIT_TAG 0e71a38e2ea6742fcc70b2bf791ca068ad1be2dc)
 FetchContent_MakeAvailable(task)
 
 # --- the reactor runtime (header-only) ---
@@ -124,8 +124,6 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 
 	add_executable(reactor_lag_test test/lag_test.cc)
 	target_link_libraries(reactor_lag_test PRIVATE reactor)
-	# Without asio's own block recycling the zero-allocation claim holds only because of the probe's slot.
-	target_compile_definitions(reactor_lag_test PRIVATE ASIO_DISABLE_SMALL_BLOCK_RECYCLING)
 	add_test(NAME reactor_lag COMMAND reactor_lag_test)
 	set_tests_properties(reactor_lag PROPERTIES TIMEOUT 60)
 

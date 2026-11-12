@@ -101,6 +101,40 @@ void qualify_retry_cancel() {
 	check(retried.has_value() && !*retried);
 	check(std::chrono::steady_clock::now() - began < std::chrono::milliseconds(500));
 }
+// A resource error pauses the accept loop on the loop's wheel: 10 ms, then 20 ms, doubling. On a
+// manual clock the pause ends in the advance() that passes it, not before, and a cancel ends it.
+void qualify_retry_manual_clock() {
+	constexpr std::uint64_t ms = 1'000'000;
+	asio::io_context io;   // never run: the clock is the manual one
+	task::inline_scheduler clock;
+	auto control = std::make_shared<reactor::detail::AcceptControl>(io);
+	const asio::error_code pressure = asio::error::no_descriptors;
+	std::vector<bool> answers;
+	task::spawn(task::scheduler_ref::of(clock),
+		[](std::shared_ptr<reactor::detail::AcceptControl> control, asio::error_code pressure, std::vector<bool>& answers) -> task::task<void> {
+			for (int i = 0; i != 3; ++i) { answers.push_back(co_await control->retry(pressure)); }
+		}(control, pressure, answers));
+	clock.run();
+	check(answers.empty() && clock.armed_timers() == 1);
+	clock.advance(9 * ms);
+	clock.run();
+	check(answers.empty());                    // 9 ms of 10
+	clock.advance(ms);
+	clock.run();
+	check(answers == std::vector<bool>{true});   // the first pause passed; the next is 20 ms
+	check(control->retry_delay == std::chrono::milliseconds(40));
+	clock.advance(19 * ms);
+	clock.run();
+	check(answers.size() == 1);
+	clock.advance(ms);
+	clock.run();
+	check(answers.size() == 2 && clock.armed_timers() == 1);   // the third pause, 40 ms, is armed
+	clock.advance(5 * ms);
+	control->stopping.store(true);
+	control->stop_on_owner();
+	clock.run();
+	check(answers == std::vector<bool>{true, true, false} && clock.armed_timers() == 0);
+}
 // Reset connections queued in the backlog (macOS reports each as an accept error) must drain
 // without the growing pause a resource error gets.
 void qualify_reset_backlog() {
@@ -195,6 +229,7 @@ int main() {
 	std::signal(SIGPIPE, SIG_IGN);
 	try {
 		qualify_retry_cancel();
+		qualify_retry_manual_clock();
 		qualify_reset_backlog();
 		qualify_lost_listener();
 		qualify(false);

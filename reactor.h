@@ -301,7 +301,7 @@ private:
 	std::condition_variable session_changed_;
 	std::size_t sessions_ = 0;
 	asio::io_context io_{1};
-	LagProbe lag_{io_};
+	LagProbe lag_{task::scheduler_ref::of(scheduler_)};   // runs on scheduler_'s wheel; outlives it, which fires its entry false
 	AdmissionGate gate_;
 	std::atomic<bool> aborting_{false};   // set by abort_all() on its caller; read by stopping()
 	bool walked_ = false;                 // loop thread only: abort_all()'s walk has begun
@@ -441,11 +441,64 @@ inline bool per_connection_accept_error(const asio::error_code& error) noexcept 
 	}
 }
 
+// One wait on the loop's timer wheel: an entry armed through the scheduler, whose fire posts the
+// waiting coroutine back to the loop. The wheel holds `self` while the entry is armed, so the
+// entry outlives a frame destroyed under it (teardown); a fire with expired false is the wheel
+// dying, which only drops that reference.
+struct WheelWait : wheel::timer_entry {
+	WheelWait() noexcept { fire = &WheelWait::on_fire; }
+	std::coroutine_handle<> handle;
+	task::scheduler_ref scheduler;
+	std::shared_ptr<WheelWait> self;
+	bool expired = false;
+
+	static void on_fire(wheel::timer_entry& entry, bool on_time) noexcept {
+		auto& wait = static_cast<WheelWait&>(entry);
+		const auto keep = std::move(wait.self);
+		if (on_time && wait.handle) { wait.expired = true; wait.scheduler.post(std::exchange(wait.handle, {})); }
+	}
+	// On the loop: ends the wait early; the coroutine resumes with expired false.
+	void cancel() noexcept {
+		if (!scheduler.cancel(*this)) { return; }
+		const auto keep = std::move(self);
+		if (handle) { scheduler.post(std::exchange(handle, {})); }
+	}
+};
+
+// co_await: suspends the running task for `delay` on its scheduler's wheel; true when the delay
+// passed, false when cancel() ended it. A scheduler without timers does not wait.
+struct WheelSleep {
+	std::shared_ptr<WheelWait> wait;
+	std::chrono::nanoseconds delay;
+	WheelSleep(std::shared_ptr<WheelWait> w, std::chrono::nanoseconds d) noexcept : wait(std::move(w)), delay(d) {}
+	WheelSleep(const WheelSleep&) = delete;
+	WheelSleep& operator=(const WheelSleep&) = delete;
+	~WheelSleep() {
+		// A frame destroyed while waiting: nothing resumes it; the entry stays for the wheel to drop.
+		if (!wait->handle) { return; }
+		wait->handle = {};
+		if (wait->scheduler.runs_here() && wait->scheduler.cancel(*wait)) { wait->self.reset(); }
+	}
+	bool await_ready() const noexcept { return false; }
+	bool await_suspend(std::coroutine_handle<> h) {
+		wait->scheduler = task::current();
+		wait->handle = h;
+		wait->self = wait;
+		if (!wait->scheduler.arm(*wait, wait->scheduler.now() + static_cast<std::uint64_t>(delay.count()))) {
+			wait->self.reset();
+			wait->handle = {};
+			return false;
+		}
+		return true;
+	}
+	bool await_resume() const noexcept { return wait->expired; }
+};
+
 struct AcceptControl {
-	explicit AcceptControl(asio::io_context& io) : executor(io.get_executor()), acceptor(std::make_unique<asio::ip::tcp::acceptor>(io)), retry_timer(io) {}
+	explicit AcceptControl(asio::io_context& io) : executor(io.get_executor()), acceptor(std::make_unique<asio::ip::tcp::acceptor>(io)) {}
 	asio::io_context::executor_type executor;
 	std::unique_ptr<asio::ip::tcp::acceptor> acceptor;
-	asio::steady_timer retry_timer;
+	std::shared_ptr<WheelWait> waiting;   // the retry pause in progress; loop thread only
 	std::chrono::milliseconds retry_delay{10};
 	// Consecutive per-connection errors skipped without a pause; past 64 each pauses 1 ms, so a
 	// listener that only ever fails this way does not spin.
@@ -472,14 +525,14 @@ struct AcceptControl {
 			delay = retry_delay;
 			retry_delay = std::min(retry_delay * 2, std::chrono::milliseconds(1000));
 		}
-		retry_timer.expires_after(delay);
-		const auto timer_error = co_await task::await_asio<void(asio::error_code)>(
-			[this](auto handler) { retry_timer.async_wait(std::move(handler)); });
-		co_return !timer_error && !stopping.load();
+		waiting = std::make_shared<WheelWait>();
+		const bool passed = co_await WheelSleep(waiting, delay);
+		waiting.reset();
+		co_return passed && !stopping.load();
 	}
 	void stop_on_owner() {
 		if (acceptor) { asio::error_code error; acceptor->close(error); }
-		retry_timer.cancel();
+		if (waiting) { waiting->cancel(); }
 	}
 	std::atomic<bool> stopping{false};
 	std::mutex mutex;

@@ -20,31 +20,32 @@
  * THE SOFTWARE.
  */
 
-// reactor::LagProbe: how late a loop runs. A timer on the loop re-arms itself and records how
-// far past its deadline each wake ran; a handler that holds the loop for 5 ms makes the next
-// wake 5 ms late. The lateness goes into log2 microsecond buckets with 4 sub-buckets each
-// (12.5% to 25% wide), read from any thread through snapshot().
+// reactor::LagProbe: how late a loop runs. An entry on the loop's timer wheel re-arms itself and
+// records how late each wake ran; a handler that holds the loop for 5 ms makes the next wake 5 ms
+// late. The wheel wakes the loop with its one Asio timer at the end of the entry's 1 ms slot, so
+// the probe aims at a whole tick and measures the wake against it: the lateness is that timer's
+// own, with no quantization from the wheel. The lateness goes into log2 microsecond buckets with
+// 4 sub-buckets each (12.5% to 25% wide), read from any thread through snapshot().
 //
 // The interval is 1 ms while the loop saw activity in the last second (note_activity()) and
 // 100 ms otherwise, so an idle loop wakes 10 times a second. The first activity after an idle
-// stretch is noticed at the next wake, up to 100 ms later. Once started it allocates nothing:
-// the timer operation lives in a slot inside the probe. A percentile is read as its bucket's
-// upper edge, so "1 ms" means the 1,024 us edge.
+// stretch is noticed at the next wake, up to 100 ms later. The entry lives inside the probe, so
+// arming allocates nothing. A percentile is read as its bucket's upper edge, so "1 ms" means the
+// 1,024 us edge.
 //
-// Thread rules: start() before the loop runs or on the loop thread; stop() from any thread;
-// snapshot() and note_activity() from any thread. Destroy the probe before its io_context.
+// Thread rules: start() before the loop runs or on the loop thread (the arm happens on the
+// loop); stop() from any thread; snapshot() and note_activity() from any thread. Destroy the
+// probe after its scheduler, or after stop() ran on the loop: an armed entry is the wheel's.
 
 #pragma once
 
-#include <asio.hpp>
+#include "task.hh"
 
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <memory>
-#include <new>
 
 namespace reactor {
 
@@ -106,89 +107,76 @@ public:
 	static constexpr std::chrono::microseconds idle_interval{100000};
 	static constexpr std::chrono::seconds busy_window{1};
 
-	explicit LagProbe(asio::io_context& io) : state_(std::make_shared<State>(io)) {}
-	~LagProbe() { stop(); }
+	// The probe is an entry on `scheduler`'s wheel. It touches the scheduler only from start()
+	// and stop(), so it may be built before the scheduler it names exists, and must be destroyed
+	// after the scheduler (which fires an armed entry once more, with expired false) or after
+	// stop() ran on the loop.
+	explicit LagProbe(task::scheduler_ref scheduler) noexcept : state_(scheduler) {}
+	~LagProbe() = default;
 
 	LagProbe(const LagProbe&) = delete;
 	LagProbe& operator=(const LagProbe&) = delete;
 
-	// Arms the timer at the idle interval; the first wake picks the interval from the activity seen.
+	// Arms the wake at the idle interval; the first wake picks the interval from the activity seen.
+	// On the loop thread it arms at once; from another thread the arm is posted to the loop.
 	void start() {
-		if (state_->started.exchange(true)) { return; }
-		state_->arm(idle_interval);
+		if (state_.started.exchange(true)) { return; }
+		if (!state_.scheduler.runs_here() && state_.scheduler.post_call(&State::start_on_loop, &state_)) { return; }
+		state_.arm(idle_interval);
 	}
+	// Ends the wakes; from any thread. The cancel runs on the loop, dropped once the loop is gone.
 	void stop() {
-		if (!state_->started.load() || state_->stopped.exchange(true)) { return; }
-		auto state = state_;
-		asio::post(state->timer.get_executor(), [state] { state->timer.cancel(); });
+		if (!state_.started.load() || state_.stopped.exchange(true) || state_.dead.load()) { return; }
+		if (!state_.scheduler.runs_here() && state_.scheduler.post_call(&State::stop_on_loop, &state_)) { return; }
+		state_.scheduler.cancel(state_);
 	}
 
 	// Marks the loop busy for the next second. Cheap enough to call per request, from any thread.
-	void note_activity() noexcept { state_->activity.fetch_add(1, std::memory_order_relaxed); }
+	void note_activity() noexcept { state_.activity.fetch_add(1, std::memory_order_relaxed); }
 
 	LagSnapshot snapshot() const noexcept {
 		LagSnapshot s;
-		for (std::size_t i = 0; i < LagSnapshot::buckets; ++i) { s.count[i] = state_->count[i].load(std::memory_order_relaxed); }
-		s.wakes = state_->wakes.load(std::memory_order_relaxed);
-		s.sum_us = state_->sum_us.load(std::memory_order_relaxed);
-		s.max_us = state_->max_us.load(std::memory_order_relaxed);
+		for (std::size_t i = 0; i < LagSnapshot::buckets; ++i) { s.count[i] = state_.count[i].load(std::memory_order_relaxed); }
+		s.wakes = state_.wakes.load(std::memory_order_relaxed);
+		s.sum_us = state_.sum_us.load(std::memory_order_relaxed);
+		s.max_us = state_.max_us.load(std::memory_order_relaxed);
 		return s;
 	}
 
 private:
-	struct State;
+	using Nanoseconds = std::uint64_t;
 
-	// Hands asio its one timer operation from a slot inside the probe, never from the heap.
-	template <class T>
-	struct SlotAllocator {
-		using value_type = T;
-		State* state;
-		explicit SlotAllocator(State* s) noexcept : state(s) {}
-		template <class U> SlotAllocator(const SlotAllocator<U>& other) noexcept : state(other.state) {}
-		T* allocate(std::size_t n) {
-			if (!state->slot_used && n * sizeof(T) <= sizeof(state->slot) && alignof(T) <= alignof(std::max_align_t)) {
-				state->slot_used = true;
-				return reinterpret_cast<T*>(state->slot);
-			}
-			return static_cast<T*>(::operator new(n * sizeof(T)));
-		}
-		void deallocate(T* p, std::size_t) noexcept {
-			if (static_cast<void*>(p) == static_cast<void*>(state->slot)) { state->slot_used = false; }
-			else { ::operator delete(p); }
-		}
-		template <class U> bool operator==(const SlotAllocator<U>& other) const noexcept { return state == other.state; }
-		template <class U> bool operator!=(const SlotAllocator<U>& other) const noexcept { return state != other.state; }
-	};
+	struct State : wheel::timer_entry {
+		static constexpr Nanoseconds tick = wheel::timer_wheel::tick;
 
-	struct Tick {
-		using allocator_type = SlotAllocator<void>;
-		std::shared_ptr<State> state;
-		allocator_type get_allocator() const noexcept { return allocator_type(state.get()); }
-		void operator()(const asio::error_code& error) const { state->tick(error); }
-	};
+		explicit State(task::scheduler_ref s) noexcept : scheduler(s) { fire = &State::on_fire; }
 
-	struct State : std::enable_shared_from_this<State> {
-		using clock = std::chrono::steady_clock;
-
-		explicit State(asio::io_context& io) : timer(io) {}
-
+		// Files the entry so the loop's Asio timer wakes at a whole tick: the entry's slot ends at
+		// `target`, which is where the scheduler sets that timer, so a wake's lateness is the timer's.
 		void arm(std::chrono::microseconds interval) {
-			due = clock::now() + interval;
-			timer.expires_at(due);
-			timer.async_wait(Tick{this->shared_from_this()});
+			target = (scheduler.now() + static_cast<Nanoseconds>(interval.count()) * 1000) / tick * tick;
+			scheduler.arm(*this, target - 1);
 		}
 
-		void tick(const asio::error_code& error) {
-			if (error || stopped.load(std::memory_order_relaxed)) { return; }
-			const auto now = clock::now();
-			const auto late = now > due ? std::chrono::duration_cast<std::chrono::microseconds>(now - due).count() : 0;
-			const auto us = static_cast<std::uint64_t>(late);
+		static void start_on_loop(void* p) { static_cast<State*>(p)->arm(idle_interval); }
+		static void stop_on_loop(void* p) { auto& s = *static_cast<State*>(p); s.scheduler.cancel(s); }
+		// The wheel is dying (expired false): the scheduler is gone, so stop() must not reach it.
+		static void on_fire(wheel::timer_entry& e, bool expired) noexcept {
+			auto& s = static_cast<State&>(e);
+			if (expired) { s.wake(); } else { s.dead.store(true); }
+		}
+
+		void wake() noexcept {
+			if (stopped.load(std::memory_order_relaxed)) { return; }
+			const Nanoseconds now = scheduler.now();
+			const Nanoseconds late = now > target ? now - target : 0;
+			const std::uint64_t us = late / 1000;
 			bump(count[LagSnapshot::index_of(us)], 1);
 			bump(wakes, 1);
 			bump(sum_us, us);
 			if (us > max_us.load(std::memory_order_relaxed)) { max_us.store(us, std::memory_order_relaxed); }
 			const auto seen = activity.load(std::memory_order_relaxed);
-			if (seen != last_activity) { last_activity = seen; busy_until = now + busy_window; }
+			if (seen != last_activity) { last_activity = seen; busy_until = now + static_cast<Nanoseconds>(std::chrono::nanoseconds(busy_window).count()); }
 			arm(now < busy_until ? busy_interval : idle_interval);
 		}
 
@@ -197,22 +185,21 @@ private:
 			counter.store(counter.load(std::memory_order_relaxed) + by, std::memory_order_relaxed);
 		}
 
-		asio::steady_timer timer;
-		clock::time_point due{};
-		clock::time_point busy_until{};
+		task::scheduler_ref scheduler;
+		Nanoseconds target = 0;
+		Nanoseconds busy_until = 0;
 		std::uint64_t last_activity = 0;
 		std::atomic<std::uint64_t> activity{0};
 		std::atomic<bool> started{false};
 		std::atomic<bool> stopped{false};
+		std::atomic<bool> dead{false};
 		std::array<std::atomic<std::uint64_t>, LagSnapshot::buckets> count{};
 		std::atomic<std::uint64_t> wakes{0};
 		std::atomic<std::uint64_t> sum_us{0};
 		std::atomic<std::uint64_t> max_us{0};
-		alignas(std::max_align_t) unsigned char slot[512];
-		bool slot_used = false;
 	};
 
-	std::shared_ptr<State> state_;
+	State state_;
 };
 
 }  // namespace reactor
