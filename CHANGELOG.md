@@ -6,6 +6,20 @@ entries are dated.
 
 Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://github.com/Kronuz/cpp-libraries/blob/main/docs/UPGRADING-2026-10.md#reactor) lists what changes for callers, how to find affected inputs, the commits not to pin, and the speedup.
 
+## 2026-11-12
+
+### Changed
+
+- Every timer a reactor loop runs is an entry on the loop's `wheel::timer_wheel`, armed through
+  `task::asio_scheduler::arm` and `cancel`. The accept loop's retry pause is a wheel entry
+  (`detail::WheelSleep`), ending 1 to about 2 ms after it is due, on the loop's tick.
+- `LagProbe` is built from a `task::scheduler_ref` (`LagProbe(task::scheduler_ref::of(scheduler))`)
+  and is an entry on that scheduler's wheel, not an `asio::steady_timer`. It aims at the tick the
+  loop's one Asio timer wakes at and records the wake's lateness against it. `start()` arms on the
+  loop, so from another thread the arm is posted. Destroy a probe after its scheduler or after
+  `stop()` ran on the loop. `Reactor::lag()` and `TcpServer::enable_lag_probe()` are unchanged.
+- Pins task at 0e71a38 (timers on Kronuz/wheel).
+
 ## 2026-11-03
 
 ### Added

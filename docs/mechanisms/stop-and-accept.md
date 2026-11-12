@@ -61,7 +61,8 @@ error); true to continue; and throws `asio::system_error` to end the loop.
 - Per-connection errors (`per_connection_accept_error`, `:428`): `ECONNABORTED`, `ECONNRESET`,
   `EPROTO`, the network errors, and `EINVAL` on macOS (a peer that reset while queued) skip
   that connection. The first 64 consecutive skips continue at once; past that each pauses 1 ms,
-  so a listener that only fails this way does not spin.
+  so a listener that only fails this way does not spin. The pause is a wheel entry: it ends
+  1 to about 2 ms after it is due, on the loop's tick.
 - `EINVAL` counts as per-connection only while the acceptor is still the bound listener
   (`listener_lost`, `:456`: `local_endpoint()` succeeds and equals `bound`). Otherwise it is
   not retryable, so it throws.
@@ -73,7 +74,10 @@ error); true to continue; and throws `asio::system_error` to end the loop.
   to stderr and `L_EXC` when the listener was already listening (at startup `wait_listening`
   rethrows it to `start()`), resets the acceptor, and marks the control finished.
 
-The timer wait is a plain `await_asio`, so `stop_on_owner`'s `retry_timer.cancel()` ends it.
+The pause is `detail::WheelSleep` on the loop's wheel (`WheelWait`, an entry armed through the scheduler),
+not an Asio timer. `AcceptControl::waiting` names the pause in progress, and `stop_on_owner` cancels it on
+the loop; the coroutine then resumes with `false`. A frame destroyed while waiting leaves the entry to the
+wheel, which holds the entry's last reference until it fires or dies.
 
 ## Invariants
 

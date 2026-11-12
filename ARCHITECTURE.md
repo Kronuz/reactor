@@ -60,6 +60,31 @@ bounded admission gate and the list of abortables to release at shutdown.
 A reactor's `io_context` is constructed with a concurrency hint of `1` (a single
 thread runs it), which lets Asio skip internal locking on the per-reactor loop.
 
+## Timers: one wheel, one Asio timer per loop
+
+A reactor's `task::asio_scheduler` owns one `wheel::timer_wheel` (Kronuz/wheel) and one
+`asio::steady_timer`. Every timer the loop runs is an entry on that wheel, armed and cancelled
+only through the scheduler's `arm` and `cancel` on the loop thread: a `task::deadline`, the
+accept loop's retry pause (`detail::WheelSleep`), the lag probe. The one Asio timer wakes the
+loop at the wheel's `next()`, the end of the earliest occupied 1 ms slot, and re-sets itself
+there after each wake, so the loop holds one kernel timer however many entries wait.
+
+```
+  entries (deadline, accept retry, lag probe) --arm--> wheel --next()--> one asio::steady_timer
+                                                         ^                          |
+                                                         +---- expire(now) <-- wake on the loop
+```
+
+The lag probe rides that timer instead of owning one. The wake it reads is the wake every entry
+waits for, so its lateness is the lateness any timer sees. The probe aims at a whole tick, where
+the scheduler sets the Asio timer for its entry, and records `now - tick`, so the wheel's 1 ms
+rounding is not counted as lag and an idle loop adds no timer for it (`reactor_lag.h`).
+
+Periodic work is a task, not a timer object: a coroutine on the loop that awaits the next
+deadline, so a stop request is a cancel token and teardown is the scheduler's. `PeriodicTimer`
+(`reactor_events.h`) is the last timer object that is not an entry on the wheel; it is removed
+once its last user moves to a task.
+
 ## Binding N reactors to one port
 
 Two modes, chosen automatically in `start()`:

@@ -84,8 +84,9 @@ runs a loop itself (`io().run()`) wraps the call in a `reactor::RunScope`.
 
 ## How late a loop runs (`reactor_lag.h`)
 
-`Reactor::lag()` is a `LagProbe`: a timer on the loop that records how far past its deadline each wake ran.
-`TcpServer::enable_lag_probe()` starts one per reactor; any other loop calls `lag().start()` before it runs.
+`Reactor::lag()` is a `LagProbe`: an entry on the loop's timer wheel that records how far past its tick each wake of the loop's Asio timer ran (see ARCHITECTURE.md, "Timers").
+`TcpServer::enable_lag_probe()` starts one per reactor; any other loop calls `lag().start()` before it runs (the arm happens on the loop).
+`LagProbe(task::scheduler_ref)` builds one for a scheduler with timers; it must be destroyed after that scheduler, or after `stop()` ran on the loop.
 The interval is 1 ms while `note_activity()` was called in the last second (a session start calls it) and 100 ms
 otherwise, so an idle loop wakes 10 times a second. `snapshot()` returns log2-microsecond buckets with 4
 sub-buckets each; `quantile_upper_us(q)` reads a percentile as its bucket's upper edge, so "1 ms" is the 1,024 us
