@@ -131,6 +131,8 @@ cmake --build build --target reactor_echo_bench
 
 ## 📚 Documentation
 
+- [One Loop Per Core](https://kronuz.github.io/blog/reactor/):
+  the Familiars post on why it exists and how it works.
 - [docs/API.md](docs/API.md): what a session gets, the UDP server, and the callback failure
   contract.
 - [ARCHITECTURE.md](ARCHITECTURE.md): the loops, the bind modes, admission, and the shutdown
