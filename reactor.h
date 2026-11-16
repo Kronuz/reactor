@@ -56,6 +56,9 @@
 #include <chrono>
 
 #include <pthread.h>
+#if defined(__FreeBSD__) || defined(__OpenBSD__)
+#  include <pthread_np.h>
+#endif
 #include <netinet/in.h>
 #include <sys/socket.h>
 
