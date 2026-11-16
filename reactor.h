@@ -57,7 +57,8 @@
 
 #include <pthread.h>
 #if defined(__FreeBSD__) || defined(__OpenBSD__)
-#  include <pthread_np.h>
+// Declared here, not via <pthread_np.h>: that pulls <sys/param.h>, whose MIN/MAX macros leak into includers.
+extern "C" void pthread_set_name_np(pthread_t, const char*);
 #endif
 #include <netinet/in.h>
 #include <sys/socket.h>
