@@ -6,6 +6,17 @@ entries are dated.
 
 Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://github.com/Kronuz/cpp-libraries/blob/main/docs/UPGRADING-2026-10.md#reactor) lists what changes for callers, how to find affected inputs, the commits not to pin, and the speedup.
 
+## 2026-11-16
+
+### Added
+
+- Loop threads are named: `reactor-<index>` for each `TcpServer` loop, `reactor-udp` for the
+  `UdpServer` loop (cut to 15 characters on Linux). On Linux they inherited their creator's name,
+  so a host's threads all read alike. `REACTOR_THREAD_NAME_PREFIX` (default `"reactor-"`),
+  `REACTOR_THREAD_REGISTER(pthread, name)` and `REACTOR_THREAD_UNREGISTER()` (no-ops by default)
+  come from `reactor_trace.h` or `REACTOR_TRACE_HEADER`, the same hooks as workpool's
+  `WORKPOOL_THREAD_*`.
+
 ## 2026-11-03
 
 ### Added

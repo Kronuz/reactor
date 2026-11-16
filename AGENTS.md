@@ -21,7 +21,8 @@ reactor_udp.h        The connectionless transport. reactor::{UdpOptions, Datagra
                      -- one reactor + one bound UDP socket + a receive loop, with the full
                      multicast toolkit (reuse_port, IP_MULTICAST_LOOP/TTL, join a group,
                      SND/RCV buffers). Includes reactor.h (reuses Reactor).
-reactor_trace.h      The logging seam and its contract: a no-op L_EXC unless the consumer
+reactor_trace.h      The seams and their contract: a no-op L_EXC, REACTOR_THREAD_REGISTER/UNREGISTER
+                     (no-ops) and REACTOR_THREAD_NAME_PREFIX ("reactor-") unless the consumer
                      points REACTOR_TRACE_HEADER at its own header (target-wide).
 reactor_lag.h        reactor::LagProbe + LagSnapshot: how late a loop runs (a self-rearming timer, 1 ms
                      while the loop saw activity in the last second, 100 ms idle; log2-us buckets with 4
@@ -48,6 +49,8 @@ test/udp_seam_test.cc  ctest "reactor_udp_seam_default" / "reactor_udp_seam_head
                      logging seam compiled as consumers do, with the no-op L_EXC and with
                      REACTOR_TRACE_HEADER (test/udp_seam_trace.h). test/udp_helpers.h
                      holds the UDP tests' shared helpers.
+test/thread_name_test.cc  ctest "reactor_thread_name": every TcpServer loop thread is "reactor-<i>", the UDP
+                     thread "reactor-udp" (pthread_getname_np from a handler posted on the loop).
 test/lag_test.cc     ctest "reactor_lag": the bucket arithmetic, a 6 ms busy handler in a >= 4,096 us bucket, zero
                      allocations on the loop thread, 10 wakes/s idle vs ~1 ms busy, stop(), a probe per TcpServer reactor.
 test/events_test.cc  ctest "reactor_events": PeriodicTimer one-shot/repeat/again/stop +

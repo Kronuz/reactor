@@ -117,6 +117,11 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	add_test(NAME reactor_callback_failure COMMAND reactor_callback_failure_test)
 	set_tests_properties(reactor_callback_failure PROPERTIES TIMEOUT 20)
 
+	add_executable(reactor_thread_name_test test/thread_name_test.cc)
+	target_link_libraries(reactor_thread_name_test PRIVATE reactor)
+	add_test(NAME reactor_thread_name COMMAND reactor_thread_name_test)
+	set_tests_properties(reactor_thread_name PROPERTIES TIMEOUT 20)
+
 	add_executable(reactor_events_test test/events_test.cc)
 	target_link_libraries(reactor_events_test PRIVATE reactor)
 	add_test(NAME reactor_events COMMAND reactor_events_test)
@@ -132,7 +137,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	# The tests count live task frames (task::detail::live_frames()); a program's translation
 	# units must all define this alike (task's ODR note), so it is set on every test target.
 	foreach(test_target reactor_accept_pressure_test reactor_test reactor_session_test reactor_alloc_test reactor_udp_test
-			reactor_udp_seam_default_test reactor_udp_seam_header_test reactor_callback_failure_test
+			reactor_udp_seam_default_test reactor_udp_seam_header_test reactor_callback_failure_test reactor_thread_name_test
 			reactor_events_test reactor_lag_test)
 		target_compile_definitions(${test_target} PRIVATE TASK_COUNT_FRAMES=1)
 	endforeach()

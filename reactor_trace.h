@@ -20,8 +20,23 @@
  * THE SOFTWARE.
  */
 
-// The reactor's logging seam: L_EXC reports an exception the runtime swallows to keep a
-// UDP owner loop alive after a datagram, posted or timer callback throws. No-op by default.
+// The reactor's extension seams, all no-ops or neutral by default (the same shape as workpool's
+// workpool_trace.h):
+//
+//   - L_EXC(...)                       reports an exception the runtime swallows to keep a UDP owner
+//                                      loop alive after a datagram, posted or timer callback throws.
+//   - REACTOR_THREAD_REGISTER(p, n)    registers a freshly named loop thread (pthread handle `p`,
+//                                      C-string name `n`, valid until the thread exits) so a crash
+//                                      handler can print per-thread callstacks. No-op by default.
+//   - REACTOR_THREAD_UNREGISTER()      releases the calling thread's registration as the loop thread
+//                                      is about to exit. No-op by default.
+//   - REACTOR_THREAD_NAME_PREFIX       prefix of every loop thread's OS-level name: the prefix plus
+//                                      the loop's index for a TcpServer ("reactor-0"), plus "udp"
+//                                      for a UdpServer. "reactor-" by default; names are cut to the
+//                                      platform limit (15 characters on Linux).
+//
+// The prefix and hooks are #ifndef-guarded: define any subset, directly or in the header that
+// REACTOR_TRACE_HEADER names, and the rest keep these defaults.
 //
 // Contract for a consumer's L_EXC:
 //   1. It takes one string literal and no other arguments, so fmt- and printf-style
@@ -41,4 +56,16 @@
 
 #ifndef L_EXC
 #define L_EXC(...) ((void)0)
+#endif
+
+#ifndef REACTOR_THREAD_REGISTER
+#define REACTOR_THREAD_REGISTER(pthread, name) ((void)0)
+#endif
+
+#ifndef REACTOR_THREAD_UNREGISTER
+#define REACTOR_THREAD_UNREGISTER() ((void)0)
+#endif
+
+#ifndef REACTOR_THREAD_NAME_PREFIX
+#define REACTOR_THREAD_NAME_PREFIX "reactor-"
 #endif

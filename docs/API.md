@@ -103,7 +103,10 @@ runs its own timers on the same loop as the receive (no locking between them).
 A handler that throws loses only that datagram: the loop reports it through `L_EXC`
 and keeps receiving. Point `REACTOR_TRACE_HEADER` at your logging header target-wide;
 `reactor_trace.h` states the hook's contract (one string literal, must not throw, the
-same definition in every translation unit).
+same definition in every translation unit). The same header can define
+`REACTOR_THREAD_REGISTER(pthread, name)`, `REACTOR_THREAD_UNREGISTER()` (crash-handler hooks, no-ops by
+default) and `REACTOR_THREAD_NAME_PREFIX` (`"reactor-"`: loop threads are `reactor-<index>`, the UDP
+thread `reactor-udp`).
 
 ```cpp
 #include "reactor_udp.h"

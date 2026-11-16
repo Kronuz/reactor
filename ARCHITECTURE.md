@@ -198,6 +198,10 @@ Two things are load-bearing and specific to UDP:
   cluster's gossip self-contained. The join uses the same interface. `INADDR_ANY` (the
   default) matches the classic transport.
 
+## Thread names and hooks (`reactor_trace.h`)
+
+Each loop thread names itself as it starts: `REACTOR_THREAD_NAME_PREFIX` (`"reactor-"` by default) plus the loop's index for a `TcpServer` (`reactor-0`), plus `udp` for a `UdpServer`, cut to the platform limit (15 characters on Linux; macOS can name only the calling thread, so the thread does it). Without it a thread inherits its creator's name on Linux. `REACTOR_THREAD_REGISTER(pthread, name)` then fires so a host can register the thread with a crash handler, and `REACTOR_THREAD_UNREGISTER()` fires as the thread exits. All three macros mirror workpool's `WORKPOOL_THREAD_*` and are `#ifndef`-guarded: define them in the header `REACTOR_TRACE_HEADER` names, target-wide, alongside `L_EXC`.
+
 ## What lives above (not here)
 
 The protocol. Message enums and a dispatch switch, framing (`[type][len][payload]`
