@@ -11,9 +11,9 @@
 # run is for `quiet exclusive`.
 set -eu
 here=$(cd "$(dirname "$0")/.." && pwd)
-flags="-std=c++20 -O3 -DNDEBUG -DASIO_STANDALONE -I$ASIO"
 case "$1" in
 build)
+	flags="-std=c++20 -O3 -DNDEBUG -DASIO_STANDALONE -I$ASIO"
 	mkdir -p "$2"
 	${CXX:-clang++} $flags -I"$JOB_REF_A_REACTOR" -I"$JOB_REF_A_TASK" "$here/benchmarks/lag_bench.cc" -o "$2/a" -pthread
 	${CXX:-clang++} $flags -I"$here" -I"$JOB_REF_TASK" -I"$JOB_REF_WHEEL" "$here/benchmarks/lag_bench.cc" -o "$2/b" -pthread
