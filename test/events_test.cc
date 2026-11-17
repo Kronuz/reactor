@@ -1,6 +1,5 @@
-// events_test -- validates the reactor loop primitives: a PeriodicTimer fires once for a
-// one-shot, repeats for a repeat interval, re-arms via again(), and stops via stop(); a
-// Signal runs its callback on the loop, and coalesces a burst of cross-thread sends.
+// events_test -- validates the reactor loop primitive: a Signal runs its callback on the
+// loop, and coalesces a burst of cross-thread sends.
 
 #include <atomic>
 #include <chrono>
@@ -29,49 +28,7 @@ int main() {
 	std::thread th([&r] { r.io().run(); });
 	auto ex = r.io().get_executor();
 
-	// [A] one-shot: fires exactly once.
-	{
-		auto n = std::make_shared<std::atomic<int>>(0);
-		reactor::PeriodicTimer t(ex);
-		t.set_callback([n] { n->fetch_add(1); });
-		t.start(0.01, 0.0);
-		std::this_thread::sleep_for(120ms);
-		check(n->load() == 1, "one-shot timer fires exactly once");
-	}
-
-	// [B] repeat: fires several times over the window, then stop() halts it.
-	{
-		auto n = std::make_shared<std::atomic<int>>(0);
-		reactor::PeriodicTimer t(ex);
-		t.set_callback([n] { n->fetch_add(1); });
-		t.start(0.01, 0.02);        // ~every 20ms
-		std::this_thread::sleep_for(150ms);
-		int mid = n->load();
-		t.stop();
-		std::promise<void> stopped;
-		asio::post(ex, [&stopped] { stopped.set_value(); });
-		stopped.get_future().get();
-		const int settled = n->load();
-		std::this_thread::sleep_for(80ms);
-		int after = n->load();
-		std::printf("     repeat fired %d times, +%d after stop()\n", mid, after - mid);
-		check(mid >= 3, "repeating timer fires multiple times");
-		check(after == settled, "stop() halts the repeating timer after owner settlement");
-	}
-
-	// [C] again(): re-arms using the stored repeat.
-	{
-		auto n = std::make_shared<std::atomic<int>>(0);
-		reactor::PeriodicTimer t(ex);
-		t.set_callback([n] { n->fetch_add(1); });
-		t.set_repeat(0.02);
-		t.again();
-		std::this_thread::sleep_for(120ms);
-		t.stop();
-		check(n->load() >= 2, "again() arms the timer for the stored repeat");
-	}
-
-	// [D] Signal: runs the callback on the loop.
+	// [A] Signal: runs the callback on the loop.
 	{
 		auto n = std::make_shared<std::atomic<int>>(0);
 		auto where = std::make_shared<std::atomic<std::thread::id>>();
@@ -83,7 +40,7 @@ int main() {
 		check(where->load() == th.get_id(), "signal callback runs on the loop thread");
 	}
 
-	// [E] Signal coalescing: a burst of sends collapses to few runs.
+	// [B] Signal coalescing: a burst of sends collapses to few runs.
 	{
 		auto runs = std::make_shared<std::atomic<int>>(0);
 		reactor::Signal s(ex);

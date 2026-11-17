@@ -1,6 +1,6 @@
 # reactor
 
-Part of [Kronuz C++ Libraries](https://github.com/Kronuz/cpp-libraries), a collection of small, reusable C++ libraries.
+Part of [Kronuz C++ Libraries](https://github.com/Kronuz/cpp-libraries), a collection of small, reusable C++ libraries. Read its story in [One Loop Per Core](https://kronuz.github.io/blog/reactor/), a Familiars post.
 
 [![CI](https://github.com/Kronuz/reactor/actions/workflows/ci.yml/badge.svg)](https://github.com/Kronuz/reactor/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -131,6 +131,8 @@ cmake --build build --target reactor_echo_bench
 
 ## 📚 Documentation
 
+- [One Loop Per Core](https://kronuz.github.io/blog/reactor/):
+  the Familiars post on why it exists and how it works.
 - [docs/API.md](docs/API.md): what a session gets, the UDP server, and the callback failure
   contract.
 - [ARCHITECTURE.md](ARCHITECTURE.md): the loops, the bind modes, admission, and the shutdown

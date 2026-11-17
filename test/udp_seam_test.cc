@@ -36,6 +36,9 @@ int main() {
 	check(delivered.load() == 1, "the datagram after a throw reaches the handler");
 #ifdef REACTOR_TRACE_HEADER
 	check(g_seam_exc.load() == 1, "the consumer's L_EXC from REACTOR_TRACE_HEADER reports the throw");
+	check(g_seam_registered.load() == 1 && g_seam_name_ok.load(), "the loop thread registers as prefix + udp");
+	srv.stop();
+	check(g_seam_unregistered.load() == 1, "the loop thread unregisters as it exits");
 #endif
 
 	std::printf("\n%s (%d failures)\n", g_fail == 0 ? "PASS" : "FAIL", g_fail);

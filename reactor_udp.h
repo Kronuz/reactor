@@ -143,6 +143,7 @@ public:
 		reactor_.claim_loop();
 		try {
 			thread_ = std::thread([this] {
+				detail::LoopThreadName name("udp");
 				while (!reactor_.io().stopped()) {
 					try { reactor_.run(); break; }
 					catch (...) { report_callback_exception(); }

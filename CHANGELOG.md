@@ -6,6 +6,24 @@ entries are dated.
 
 Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://github.com/Kronuz/cpp-libraries/blob/main/docs/UPGRADING-2026-10.md#reactor) lists what changes for callers, how to find affected inputs, the commits not to pin, and the speedup.
 
+## 2026-11-17
+
+### Removed
+
+- `reactor::PeriodicTimer` (`reactor_events.h`) and its tests. Use the loop's wheel: a task awaiting
+  the next deadline, or an entry armed through `task::asio_scheduler::arm` (D76). `Signal` stays.
+
+## 2026-11-16
+
+### Added
+
+- Loop threads are named: `reactor-<index>` for each `TcpServer` loop, `reactor-udp` for the
+  `UdpServer` loop (cut to 15 characters on Linux). On Linux they inherited their creator's name,
+  so a host's threads all read alike. `REACTOR_THREAD_NAME_PREFIX` (default `"reactor-"`),
+  `REACTOR_THREAD_REGISTER(pthread, name)` and `REACTOR_THREAD_UNREGISTER()` (no-ops by default)
+  come from `reactor_trace.h` or `REACTOR_TRACE_HEADER`, the same hooks as workpool's
+  `WORKPOOL_THREAD_*`.
+
 ## 2026-11-12
 
 ### Changed
@@ -18,7 +36,7 @@ Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://gith
   loop's one Asio timer wakes at and records the wake's lateness against it. `start()` arms on the
   loop, so from another thread the arm is posted. Destroy a probe after its scheduler or after
   `stop()` ran on the loop. `Reactor::lag()` and `TcpServer::enable_lag_probe()` are unchanged.
-- Pins task at 0e71a38 (timers on Kronuz/wheel).
+- Pins task at 18eb516 (timers on Kronuz/wheel).
 
 ## 2026-11-03
 

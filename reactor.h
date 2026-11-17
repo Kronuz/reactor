@@ -55,6 +55,11 @@
 #include <cstdio>
 #include <chrono>
 
+#include <pthread.h>
+#if defined(__FreeBSD__) || defined(__OpenBSD__)
+// Declared here, not via <pthread_np.h>: that pulls <sys/param.h>, whose MIN/MAX macros leak into includers.
+extern "C" void pthread_set_name_np(pthread_t, const char*);
+#endif
 #include <netinet/in.h>
 #include <sys/socket.h>
 
@@ -67,6 +72,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <stdexcept>
 #include <thread>
 #include <utility>
@@ -315,6 +321,30 @@ private:
 };
 
 namespace detail {
+
+// Names the calling loop thread (what top, gdb and a thread census show) and registers it;
+// the guard unregisters it on every exit. Linux cuts names at 15 characters; macOS names only
+// the calling thread, which is why the thread names itself.
+struct LoopThreadName {
+	std::string name;
+	explicit LoopThreadName(std::string_view suffix) : name(std::string(REACTOR_THREAD_NAME_PREFIX) + std::string(suffix)) {
+#if defined(__linux__)
+		if (name.size() > 15) { name.resize(15); }
+#endif
+		[[maybe_unused]] const pthread_t self = pthread_self();
+#if defined(__APPLE__)
+		pthread_setname_np(name.c_str());
+#elif defined(__linux__)
+		pthread_setname_np(self, name.c_str());
+#elif defined(__FreeBSD__) || defined(__OpenBSD__)
+		pthread_set_name_np(self, name.c_str());
+#endif
+		REACTOR_THREAD_REGISTER(self, name.c_str());
+	}
+	LoopThreadName(const LoopThreadName&) = delete;
+	LoopThreadName& operator=(const LoopThreadName&) = delete;
+	~LoopThreadName() { REACTOR_THREAD_UNREGISTER(); }
+};
 // Pins Reactor's member order. The scheduler is destroyed first, so a root it destroys (a session's
 // frame) still reaches the loop, the abortables and the session count; io_ is destroyed after the
 // session count, so a handed-off session it destroys unrun still leaves the count.
@@ -718,10 +748,12 @@ public:
 			if (lag_probe_) { r->lag().start(); }
 		}
 		// Every possible session destination must be running before admission.
+		std::size_t index = 0;
 		for (auto& r : reactors_) {
 			Reactor* rp = r.get();
 			rp->claim_loop();
-			try { threads_.emplace_back([rp] { rp->run(); rp->release_loop(); }); } catch (...) { rp->release_loop(); throw; }
+			const std::size_t loop_index = index++;
+			try { threads_.emplace_back([rp, loop_index] { detail::LoopThreadName name(std::to_string(loop_index)); rp->run(); rp->release_loop(); }); } catch (...) { rp->release_loop(); throw; }
 		}
 		if (shared) {
 			std::vector<Reactor*> raw;

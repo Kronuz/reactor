@@ -21,16 +21,16 @@ reactor_udp.h        The connectionless transport. reactor::{UdpOptions, Datagra
                      -- one reactor + one bound UDP socket + a receive loop, with the full
                      multicast toolkit (reuse_port, IP_MULTICAST_LOOP/TTL, join a group,
                      SND/RCV buffers). Includes reactor.h (reuses Reactor).
-reactor_trace.h      The logging seam and its contract: a no-op L_EXC unless the consumer
+reactor_trace.h      The seams and their contract: a no-op L_EXC, REACTOR_THREAD_REGISTER/UNREGISTER
+                     (no-ops) and REACTOR_THREAD_NAME_PREFIX ("reactor-") unless the consumer
                      points REACTOR_TRACE_HEADER at its own header (target-wide).
 reactor_lag.h        reactor::LagProbe + LagSnapshot: how late a loop runs (a self-rearming entry on the
                      loop's timer wheel, read against the tick the loop's Asio timer wakes at; 1 ms
                      while the loop saw activity in the last second, 100 ms idle; log2-us buckets with 4
                      sub-buckets; no allocation once started). Reactor::lag(), TcpServer::enable_lag_probe().
-reactor_events.h     Loop primitives: reactor::PeriodicTimer (ev::timer replacement --
-                     start/again/stop/repeat over steady_timer) + reactor::Signal (ev::async
-                     replacement -- send() posts to the loop, coalescing). For lifting a
-                     single-threaded protocol (gossip/Raft) onto a reactor loop.
+reactor_events.h     Loop primitive: reactor::Signal (ev::async replacement -- send() posts to
+                     the loop, coalescing). For lifting a single-threaded protocol
+                     (gossip/Raft) onto a reactor loop. Timers are wheel entries, not objects.
 CMakeLists.txt       Header-only INTERFACE target reactor::reactor; fetches standalone
                      Asio (asio-1-36-0) or reuses -DASIO_INCLUDE_DIR; builds the tests
                      only when this repo is top-level.
@@ -49,12 +49,13 @@ test/udp_seam_test.cc  ctest "reactor_udp_seam_default" / "reactor_udp_seam_head
                      logging seam compiled as consumers do, with the no-op L_EXC and with
                      REACTOR_TRACE_HEADER (test/udp_seam_trace.h). test/udp_helpers.h
                      holds the UDP tests' shared helpers.
+test/thread_name_test.cc  ctest "reactor_thread_name": every TcpServer loop thread is "reactor-<i>", the UDP
+                     thread "reactor-udp" (pthread_getname_np from a handler posted on the loop).
 test/lag_test.cc     ctest "reactor_lag": the bucket arithmetic, a 6 ms busy handler in a >= 4,096 us bucket, zero
                      allocations on the loop thread, 10 wakes/s idle vs ~1 ms busy, stop(), a probe per TcpServer reactor,
                      the probe on a manual clock.
 benchmarks/lag_bench.cc, lag_ab.sh   what the probe reads idle and loaded, and its A/B against the probe before the wheel.
-test/events_test.cc  ctest "reactor_events": PeriodicTimer one-shot/repeat/again/stop +
-                     Signal runs-on-the-loop and coalescing.
+test/events_test.cc  ctest "reactor_events": Signal runs-on-the-loop and coalescing.
 examples/echo_server.cc   A runnable TCP echo server -- the smallest reactor::TcpServer
                      (a Session that reads and writes back). `nc localhost <port>` to try it.
 benchmarks/echo_bench.cc  The reactor pool's request throughput + latency: an echo server +

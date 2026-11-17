@@ -81,9 +81,7 @@ the scheduler sets the Asio timer for its entry, and records `now - tick`, so th
 rounding is not counted as lag and an idle loop adds no timer for it (`reactor_lag.h`).
 
 Periodic work is a task, not a timer object: a coroutine on the loop that awaits the next
-deadline, so a stop request is a cancel token and teardown is the scheduler's. `PeriodicTimer`
-(`reactor_events.h`) is the last timer object that is not an entry on the wheel; it is removed
-once its last user moves to a task.
+deadline, so a stop request is a cancel token and teardown is the scheduler's.
 
 ## Binding N reactors to one port
 
@@ -223,6 +221,10 @@ Two things are load-bearing and specific to UDP:
   cluster's gossip self-contained. The join uses the same interface. `INADDR_ANY` (the
   default) matches the classic transport.
 
+## Thread names and hooks (`reactor_trace.h`)
+
+Each loop thread names itself as it starts: `REACTOR_THREAD_NAME_PREFIX` (`"reactor-"` by default) plus the loop's index for a `TcpServer` (`reactor-0`), plus `udp` for a `UdpServer`, cut to the platform limit (15 characters on Linux; macOS can name only the calling thread, so the thread does it). Without it a thread inherits its creator's name on Linux. `REACTOR_THREAD_REGISTER(pthread, name)` then fires so a host can register the thread with a crash handler, and `REACTOR_THREAD_UNREGISTER()` fires as the thread exits. All three macros mirror workpool's `WORKPOOL_THREAD_*` and are `#ifndef`-guarded: define them in the header `REACTOR_TRACE_HEADER` names, target-wide, alongside `L_EXC`.
+
 ## What lives above (not here)
 
 The protocol. Message enums and a dispatch switch, framing (`[type][len][payload]`
@@ -242,4 +244,4 @@ There is one `Session` type and one constructor, `TcpServer(reactors, admission_
 
 The UDP owner catches exceptions escaping posted and timer callbacks, reports through the existing `L_EXC` seam and resumes `io_context::run()` without restarting a stopped context. A throwing diagnostic hook cannot terminate that owner. Explicit stop remains terminal. Datagram-handler isolation and receive-error behavior are unchanged.
 
-`PeriodicTimer` rearms its configured repetition after a callback throws, then propagates the exception to the executor owner. One-shot timers remain one-shot; queued stop/rearm operations retain their existing generation checks. Caller-owned event loops still receive callback exceptions and choose their own handling. Signal callbacks retain their existing coalescing contract; protocols must arrange another wake when an exception leaves queued work.
+Caller-owned event loops still receive callback exceptions and choose their own handling. Signal callbacks retain their existing coalescing contract; protocols must arrange another wake when an exception leaves queued work.

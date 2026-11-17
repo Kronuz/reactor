@@ -53,30 +53,20 @@ int main() {
 		reactor::UdpServer server([](std::string_view, const asio::ip::udp::endpoint&) {});
 		reactor::UdpOptions options; options.address = "127.0.0.1"; server.set_options(options);
 		reactor::Signal signal(server.io().get_executor());
-		reactor::PeriodicTimer repeating(server.io().get_executor()), once(server.io().get_executor()), stopped(server.io().get_executor());
-		std::atomic<unsigned> progressed{0}, repeats{0}, shots{0}, stops{0};
+		std::atomic<unsigned> progressed{0};
 		StopOnExit stop_server{server};
 		signal.set_callback([] { throw std::runtime_error("signal failure"); });
-		repeating.set_callback([&] {
-			if (++repeats == 1) { throw std::runtime_error("timer failure"); }
-			repeating.stop();
-		});
-		once.set_callback([&] { ++shots; throw 7; });
-		stopped.set_callback([&] { ++stops; stopped.stop(); throw std::runtime_error("stopped timer failure"); });
 		server.start(0);
 		signal.send();
 		asio::post(server.io(), [&] { ++progressed; });
-		repeating.start(0.001, 0.001);
-		once.start(0.001, 0.0);
-		stopped.start(0.001, 0.001);
-		wait_for(progressed, 1); wait_for(repeats, 2); wait_for(shots, 1); wait_for(stops, 1);
+		wait_for(progressed, 1);
 		asio::post(server.io(), [&] { signal.send(); });
 		asio::post(server.io(), [&] { ++progressed; });
 		wait_for(progressed, 2);
 		const auto deadline = std::chrono::steady_clock::now() + 3s;
-		while (reports.load() < 5 && std::chrono::steady_clock::now() < deadline) { std::this_thread::sleep_for(1ms); }
+		while (reports.load() < 2 && std::chrono::steady_clock::now() < deadline) { std::this_thread::sleep_for(1ms); }
 		server.stop();
-		check(shots == 1 && stops == 1 && repeats == 2 && reports == 5 && in_flight == 5);
+		check(reports == 2 && in_flight == 2);
 		{
 			reactor::UdpServer explicit_stop([](std::string_view, const asio::ip::udp::endpoint&) {});
 			explicit_stop.set_options(options);
@@ -96,11 +86,11 @@ int main() {
 			unwound.set_options(options);
 			try {
 				std::atomic<unsigned> calls{0};
-				reactor::PeriodicTimer timer(unwound.io().get_executor());
+				reactor::Signal wake(unwound.io().get_executor());
 				StopOnExit stop_unwound{unwound};
-				timer.set_callback([&] { ++calls; });
+				wake.set_callback([&] { ++calls; });
 				unwound.start(0);
-				timer.start(0.001, 0.001);
+				wake.send();
 				wait_for(calls, 1);
 				throw ForcedTestFailure{};
 			} catch (const ForcedTestFailure&) {}

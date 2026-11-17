@@ -104,7 +104,10 @@ runs its own timers on the same loop as the receive (no locking between them).
 A handler that throws loses only that datagram: the loop reports it through `L_EXC`
 and keeps receiving. Point `REACTOR_TRACE_HEADER` at your logging header target-wide;
 `reactor_trace.h` states the hook's contract (one string literal, must not throw, the
-same definition in every translation unit).
+same definition in every translation unit). The same header can define
+`REACTOR_THREAD_REGISTER(pthread, name)`, `REACTOR_THREAD_UNREGISTER()` (crash-handler hooks, no-ops by
+default) and `REACTOR_THREAD_NAME_PREFIX` (`"reactor-"`: loop threads are `reactor-<index>`, the UDP
+thread `reactor-udp`).
 
 ```cpp
 #include "reactor_udp.h"
@@ -123,6 +126,6 @@ disc.send(bytes);                       // to the group
 
 ## Callback failure
 
-`PeriodicTimer` propagates callback exceptions after rearming an unchanged nonzero repeat. A one-shot stays one-shot, and queued `stop()`/`again()` operations retain their normal ordering. `Signal` clears its pending flag before invoking its callback, so a protocol that leaves work queued after throwing must arrange a subsequent wake.
+`Signal` clears its pending flag before invoking its callback, so a protocol that leaves work queued after throwing must arrange a subsequent wake.
 
 `UdpServer` catches errors escaping posted/timer handlers, reports through `L_EXC` with the exception in flight and continues its owner loop. Trace-hook exceptions are contained too. This never restarts an explicitly stopped `io_context`. A caller running its own event loop still receives exceptions and owns the handling policy.

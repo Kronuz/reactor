@@ -20,12 +20,11 @@
  * THE SOFTWARE.
  */
 
-// reactor loop primitives: PeriodicTimer and Signal. These are the Asio equivalents of a
-// libev ev::timer and ev::async, so a single-threaded protocol (a gossip/Raft loop) can
-// be lifted onto a reactor's io_context with a near-verbatim diff to its logic. Both run
-// their callback ON the reactor thread; both accept control calls from ANY thread (they
-// marshal the actual op onto the loop), matching the safety guarantee ev::async gave and
-// the discipline ev::timer required.
+// reactor loop primitive: Signal, the Asio equivalent of a libev ev::async, so a
+// single-threaded protocol (a gossip/Raft loop) can be lifted onto a reactor's io_context
+// with a near-verbatim diff to its logic. It runs its callback ON the reactor thread and
+// accepts send() from ANY thread (it marshals the op onto the loop). Timers are entries on
+// the loop's wheel (see ARCHITECTURE.md), not objects here.
 //
 // Standalone Asio only (ASIO_STANDALONE), header-only, C++20.
 
@@ -34,88 +33,11 @@
 #include <asio.hpp>
 
 #include <atomic>
-#include <exception>
-#include <chrono>
 #include <functional>
 #include <memory>
 #include <utility>
 
 namespace reactor {
-
-// A repeating (or one-shot) timer on a reactor loop -- the ev::timer replacement. The
-// callback fires on the loop thread; start()/again()/stop() may be called from any thread
-// (they post the steady_timer op onto the executor). start(after, repeat): fire after
-// `after` seconds, then every `repeat` seconds (repeat == 0 => one-shot). again(): re-arm
-// for `repeat` (stop if repeat == 0). Mirrors ev::timer's after/repeat/again semantics.
-class PeriodicTimer {
-public:
-	explicit PeriodicTimer(asio::any_io_executor ex)
-		: ex_(std::move(ex)), state_(std::make_shared<State>(ex_)) {}
-
-	void set_callback(std::function<void()> cb) { state_->cb = std::move(cb); }
-
-	double repeat() const { return state_->repeat_seconds.load(std::memory_order_relaxed); }
-	void set_repeat(double repeat_seconds) { state_->repeat_seconds.store(repeat_seconds, std::memory_order_relaxed); }
-
-	// Fire after `after` seconds, then every `repeat` seconds (0 => one-shot).
-	void start(double after, double repeat) {
-		auto st = state_;
-		st->repeat_seconds.store(repeat, std::memory_order_relaxed);
-		asio::post(ex_, [st, after] { st->arm(after); });
-	}
-
-	// Re-arm for the stored repeat interval (ev::timer::again); stop if repeat == 0.
-	void again() {
-		auto st = state_;
-		asio::post(ex_, [st] {
-			double r = st->repeat_seconds.load(std::memory_order_relaxed);
-			if (r > 0.0) { st->arm(r); } else { st->cancel(); }
-		});
-	}
-
-	void stop() {
-		auto st = state_;
-		asio::post(ex_, [st] { st->cancel(); });
-	}
-
-private:
-	struct State : std::enable_shared_from_this<State> {
-		asio::steady_timer timer;
-		std::function<void()> cb;
-		std::atomic<double> repeat_seconds{0.0};
-		std::uint64_t generation = 0;
-		explicit State(const asio::any_io_executor& ex) : timer(ex) {}
-
-		static std::chrono::nanoseconds to_ns(double seconds) {
-			return std::chrono::duration_cast<std::chrono::nanoseconds>(
-				std::chrono::duration<double>(seconds));
-		}
-
-		void cancel() {
-			++generation;
-			timer.cancel();
-		}
-
-		// (Re)arm the timer to fire after `seconds`; re-arms itself for repeat on fire.
-		void arm(double seconds) {
-			const auto admitted = ++generation;
-			timer.expires_after(to_ns(seconds));
-			auto self = shared_from_this();
-			timer.async_wait([self, admitted](const asio::error_code& ec) {
-				if (ec || admitted != self->generation) { return; }   // cancelled / re-armed
-				std::exception_ptr failure;
-				try { if (self->cb) { self->cb(); } }
-				catch (...) { failure = std::current_exception(); }
-				double r = self->repeat_seconds.load(std::memory_order_relaxed);
-				if (r > 0.0 && admitted == self->generation) { self->arm(r); }
-				if (failure) { std::rethrow_exception(failure); }
-			});
-		}
-	};
-
-	asio::any_io_executor ex_;
-	std::shared_ptr<State> state_;
-};
 
 // A cross-thread wake-the-loop-and-run-this signal -- the ev::async replacement. send()
 // from any thread schedules the callback on the loop; multiple sends before the callback

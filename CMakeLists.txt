@@ -31,9 +31,9 @@ if(ASIO_INCLUDE_DIR STREQUAL "")
 endif()
 
 # --- task (cancellable coroutines; the Session type and the loops' scheduler) ---
-# The one place the pin lives: task main with its timers on Kronuz/wheel (task:0e71a38).
+# The one place the pin lives: task main with its timers on Kronuz/wheel (task:18eb516).
 # Set FETCHCONTENT_SOURCE_DIR_TASK to build against a local checkout instead.
-FetchContent_Declare(task GIT_REPOSITORY https://github.com/Kronuz/task.git GIT_TAG 0e71a38e2ea6742fcc70b2bf791ca068ad1be2dc)
+FetchContent_Declare(task GIT_REPOSITORY https://github.com/Kronuz/task.git GIT_TAG 18eb51672e4f306aac508bd0444f6d367eac4291)
 FetchContent_MakeAvailable(task)
 
 # --- the reactor runtime (header-only) ---
@@ -121,6 +121,11 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	add_test(NAME reactor_callback_failure COMMAND reactor_callback_failure_test)
 	set_tests_properties(reactor_callback_failure PROPERTIES TIMEOUT 20)
 
+	add_executable(reactor_thread_name_test test/thread_name_test.cc)
+	target_link_libraries(reactor_thread_name_test PRIVATE reactor)
+	add_test(NAME reactor_thread_name COMMAND reactor_thread_name_test)
+	set_tests_properties(reactor_thread_name PROPERTIES TIMEOUT 20)
+
 	add_executable(reactor_events_test test/events_test.cc)
 	target_link_libraries(reactor_events_test PRIVATE reactor)
 	add_test(NAME reactor_events COMMAND reactor_events_test)
@@ -134,7 +139,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	# The tests count live task frames (task::detail::live_frames()); a program's translation
 	# units must all define this alike (task's ODR note), so it is set on every test target.
 	foreach(test_target reactor_accept_pressure_test reactor_test reactor_session_test reactor_alloc_test reactor_udp_test
-			reactor_udp_seam_default_test reactor_udp_seam_header_test reactor_callback_failure_test
+			reactor_udp_seam_default_test reactor_udp_seam_header_test reactor_callback_failure_test reactor_thread_name_test
 			reactor_events_test reactor_lag_test)
 		target_compile_definitions(${test_target} PRIVATE TASK_COUNT_FRAMES=1)
 	endforeach()
