@@ -68,7 +68,7 @@ between the waiter's read and its sleep blocks until the waiter sleeps, then rea
 token wakes the drain through a `task::cancel_callback`. A refused `try_enter` gives its slot
 back through the same `leave()`, since it can be the one that brings the gate to zero. Before
 `wait_requests` arms the flag, a leave costs one load more on its last-leave path than it did;
-`test/gate_ab.sh` measures it.
+`docs/perf/gate-leave.md` measures it within A/A noise.
 
 ## The phases## The phases
 
