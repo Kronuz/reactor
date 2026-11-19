@@ -6,6 +6,16 @@ entries are dated.
 
 Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://github.com/Kronuz/cpp-libraries/blob/main/docs/UPGRADING-2026-10.md#reactor) lists what changes for callers, how to find affected inputs, the commits not to pin, and the speedup.
 
+## 2026-11-19
+
+### Changed
+
+- `reactor::tls::configure` parses a certificate, key or authority file only when its bytes
+  changed since the last parse of that path: unchanged files load once across every context,
+  and a rotated file is served by the next call ([the cache](docs/mechanisms/tls-certificate-cache.md)).
+  Contexts configured from the same files share the parsed objects, with their certificate
+  extensions decoded before they are shared.
+
 ## 2026-11-17
 
 ### Removed
