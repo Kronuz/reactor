@@ -23,9 +23,10 @@ connection. Reach for it for a custom protocol server that should not reinvent t
 - **Admission with backpressure.** Each reactor has a bounded `AdmissionGate`. A full gate
   refuses the request, and the session answers with its protocol's busy signal instead of
   queueing it.
-- **Shutdown that finishes.** `stop()` asks every tracked request to stop on its own loop, reaps
-  the accepts, gives sessions a grace period (5 s by default), forces what a stalled peer still
-  holds, then joins.
+- **Shutdown that finishes.** A phased stop closes the listeners (`stop_accepting()`), waits for
+  requests in flight (`wait_requests(token)`), cancels them (`cancel_requests()`), then `stop()`
+  gives sessions a grace period (5 s by default), forces what a stalled peer still holds and
+  joins. `stop()` alone stops accepting, cancels at once, then does the same.
 - **Connection limits** with exact accounting, and accept retry under descriptor pressure.
 - **UDP too.** `UdpServer` with multicast, for gossip and discovery. A handler that throws costs
   one datagram; the receive loop keeps running.
@@ -84,8 +85,10 @@ target_link_libraries(my_app PRIVATE reactor::reactor)  # and reactor::tls for T
 ```cpp
 #include "reactor.h"      // TcpServer, Reactor, AdmissionGate
 #include "reactor_udp.h"  // UdpServer
-#include "reactor_tls.h"  // reactor::tls
+#include "reactor_tls.h"  // reactor::tls: server_context, seconds_to_expiry
 ```
+
+`reactor::raise_open_files(wanted)` raises the soft descriptor limit for a server's connections.
 
 ## 🎯 When to use it
 

@@ -37,7 +37,7 @@ wire format.
 ```
 
 The two transports share `Reactor` (the io_context + gate + intrusive abortable list)
-and the abort→stop→join shutdown; they differ only in the connection model — TCP accepts
+and the accept-close→abort→stop→join shutdown; they differ only in the connection model — TCP accepts
 and spawns a Session coroutine per connection, UDP runs one receive loop and calls the
 Datagram handler per packet. UDP has no accept and no per-connection state, so its
 `UdpServer` is a single reactor (a gossip protocol is single-threaded); it exposes `io()`
@@ -139,16 +139,17 @@ NAK, a drop) instead of letting a backlog grow without limit. `try_enter()`/`lea
 are the unscoped form, and `rejected` counts the refusals. A limit of 0 admits
 everything and still counts.
 
-## Shutdown: abort, grace, force, stop, join
+## Shutdown: close, wait, cancel, force, stop, join
 
 The hard part of any server runtime. A request can be parked deep in a `co_await`,
 and simply stopping the `io_context` would strand it and hang the join. So `stop()`
-runs a strict order:
+runs a strict order, each part also a call (`stop_accepting()`, `cancel_requests()`) that is
+idempotent and skipped when already run:
 
 ```
   stop():
-    1. reactor.abort_all()   for every reactor  -- on each loop: abort() every tracked Abortable
-    2. close and reap accepts on their owner loops -- all peer socket services remain alive
+    1. close and reap accepts on their owner loops -- a new connection is refused; sockets stay alive
+    2. reactor.abort_all()   for every reactor  -- on each loop: abort() every tracked Abortable
     3. wait for the sessions, up to the grace      -- a read ends at abort(); a write may finish
     4. reactor.force_all()   if any are left       -- force() shuts each session's connection down
     5. wait for the sessions, up to the grace      -- each ends once its socket wait ends
@@ -157,7 +158,7 @@ runs a strict order:
 ```
 
 Anything a Session can wait on registers with `Reactor::track(a)` as an `Abortable`;
-step 1 calls its `abort()`, which requests: the wait ends at its next checkpoint, and a
+step 2 calls its `abort()`, which requests: the wait ends at its next checkpoint, and a
 write is left to finish. Step 4's `force()` is the second stage: it releases the
 resource a write is blocked on, and each session's own control shuts its connection down
 (`shutdown(2)` on the accepted descriptor, while it still names that peer), which ends any
@@ -165,6 +166,11 @@ wait on the socket that does not take the token. `stop()` returns within twice t
 (`set_shutdown_grace`, 5 s by default) plus the time to stop and join the loops; a session
 still running then (one waiting on another server's loop) stays suspended until
 `destroy_roots()` destroys it.
+
+A server that lets requests finish first runs `stop_accepting()`, `wait_requests(token)` (blocks
+until every reactor's gate is at zero, or the token), `cancel_requests()`, then `stop()`; `stop()`
+alone cancels requests in flight at once. `reactor::raise_open_files` and `reactor::tls::server_context`
+/ `seconds_to_expiry` serve a server's main (docs/API.md).
 
 `stop()` is the first of task's four teardown phases. `close()` closes every reactor's
 `task::asio_scheduler` (what is posted to it is dropped, what is spawned on it is destroyed

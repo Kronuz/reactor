@@ -70,7 +70,7 @@ back through the same `leave()`, since it can be the one that brings the gate to
 `wait_requests` arms the flag, a leave costs one load more on its last-leave path than it did;
 `docs/perf/gate-leave.md` measures it within A/A noise.
 
-## The phases## The phases
+## The phases
 
 `stop()` is task's phase 1; `close()` and `destroy_roots()` are phases 2 and 3 (`reactor.h:913`, `:919`):
 
