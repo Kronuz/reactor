@@ -20,10 +20,11 @@
  * THE SOFTWARE.
  */
 
-// reactor::tls: incomplete options for each role are refused, and client connections bind
-// IP literals and DNS names but refuse empty names and embedded NULs. Unchanged files load
-// once however many contexts use them; a rotated file is served by the next configure.
-// `reactor_tls_test [basic|cache|rotation|threads]` runs one part; no argument runs all.
+// reactor::tls: incomplete options for each role are refused, server_context refuses a loose key and
+// a certificate out of its dates, and client connections bind IP literals and DNS names but refuse
+// empty names and embedded NULs. Unchanged files load once however many contexts use them; a
+// rotated file is served by the next configure.
+// `reactor_tls_test [basic|server_context|cache|rotation|threads]` runs one part; none runs all.
 #include "reactor_tls.h"
 
 #include <cstdio>
@@ -31,7 +32,9 @@
 #include <filesystem>
 #include <openssl/pem.h>
 #include <openssl/x509v3.h>
+#include <memory>
 #include <set>
+#include <sys/stat.h>
 #include <thread>
 #include <unistd.h>
 #include <utility>
@@ -46,13 +49,14 @@ static int failures = 0;
 	} while (0)
 
 // A self-signed certificate for localhost, and its key, written as PEM files.
-static void self_signed(const std::string& cert_path, const std::string& key_path, bool rsa = false) {
+static void self_signed(const std::string& cert_path, const std::string& key_path, bool rsa = false, long not_before = 0,
+	long not_after = 3600) {
 	EVP_PKEY* key = rsa ? EVP_RSA_gen(2048) : EVP_EC_gen("P-256");
 	X509* x = X509_new();
 	X509_set_version(x, 2);
 	ASN1_INTEGER_set(X509_get_serialNumber(x), 1);
-	X509_gmtime_adj(X509_getm_notBefore(x), 0);
-	X509_gmtime_adj(X509_getm_notAfter(x), 3600);
+	X509_gmtime_adj(X509_getm_notBefore(x), not_before);
+	X509_gmtime_adj(X509_getm_notAfter(x), not_after);
 	X509_set_pubkey(x, key);
 	X509_NAME* name = X509_NAME_new();
 	X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, reinterpret_cast<const unsigned char*>("localhost"), -1, -1, 0);
@@ -76,6 +80,7 @@ static void self_signed(const std::string& cert_path, const std::string& key_pat
 	f = std::fopen(key_path.c_str(), "wb");
 	PEM_write_PrivateKey(f, key, nullptr, nullptr, 0, nullptr, nullptr);
 	std::fclose(f);
+	::chmod(key_path.c_str(), 0600);
 	X509_free(x);
 	EVP_PKEY_free(key);
 }
@@ -160,26 +165,32 @@ static bool same(X509* x, const std::string& path) {
 static void copy(const std::string& from, const std::string& to) { std::filesystem::copy_file(from, to, std::filesystem::copy_options::overwrite_existing); }
 
 // Repeated configures of unchanged files share one parse: one leaf, one key and one
-// trusted certificate across every context, and on a context configured twice.
+// trusted certificate across every live context, server_context's included, and on a
+// context configured twice.
 static void cache(const std::string& dir) {
 	const std::string cert = dir + "/cache.pem", key = dir + "/cache.key";
 	self_signed(cert, key);
+	::chmod(key.c_str(), 0600);
+	std::vector<std::shared_ptr<asio::ssl::context>> servers, clients;   // alive, so no object is freed and reused
 	std::set<X509*> leaves, authorities;
 	std::set<EVP_PKEY*> keys;
 	for (int i = 0; i < 50; ++i) {
-		asio::ssl::context server(asio::ssl::context::tls), client(asio::ssl::context::tls);
-		reactor::tls::configure(server, Options{cert, key, ""}, Role::Server);
-		reactor::tls::configure(client, Options{"", "", cert}, Role::Client);
-		if (i == 0) { reactor::tls::configure(server, Options{cert, key, ""}, Role::Server); }
-		leaves.insert(presented(server));
-		keys.insert(SSL_CTX_get0_privatekey(server.native_handle()));
-		for (X509* x : trusted(client)) { authorities.insert(x); }
-		CHECK(handshake(server, client) == X509_V_OK);
+		auto server = i % 2 ? reactor::tls::server_context(Options{cert, key, ""}) : std::make_shared<asio::ssl::context>(asio::ssl::context::tls);
+		auto client = std::make_shared<asio::ssl::context>(asio::ssl::context::tls);
+		if (i % 2 == 0) { reactor::tls::configure(*server, Options{cert, key, ""}, Role::Server); }
+		reactor::tls::configure(*client, Options{"", "", cert}, Role::Client);
+		if (i == 0) { reactor::tls::configure(*server, Options{cert, key, ""}, Role::Server); }
+		leaves.insert(presented(*server));
+		keys.insert(SSL_CTX_get0_privatekey(server->native_handle()));
+		for (X509* x : trusted(*client)) { authorities.insert(x); }
+		CHECK(handshake(*server, *client) == X509_V_OK);
+		servers.push_back(std::move(server));
+		clients.push_back(std::move(client));
 	}
 	CHECK(leaves.size() == 1);
 	CHECK(keys.size() == 1);
 	CHECK(authorities.size() == 1);
-	CHECK(same(*leaves.begin(), cert));
+	CHECK(same(presented(*servers.front()), cert));
 	std::remove(cert.c_str());
 	std::remove(key.c_str());
 }
@@ -268,6 +279,64 @@ static void threads(const std::string& dir) {
 	std::remove(key.c_str());
 }
 
+// The message server_context refuses with, or "" when it accepts.
+static std::string refusal(const std::string& cert, const std::string& key) {
+	try {
+		(void)reactor::tls::server_context(reactor::tls::Options{cert, key, ""});
+	} catch (const std::invalid_argument& e) {
+		return e.what();
+	}
+	return "";
+}
+static bool contains(const std::string& text, const char* part) { return text.find(part) != std::string::npos; }
+
+// server_context: Xapiand's startup checks (the key's mode, the validity dates, the pair) and strict;
+// seconds_to_expiry against the certificate's notAfter and the 14-day warning.
+static void server_context(const std::string& dir) {
+	const std::string cert = dir + "/sc.pem", key = dir + "/sc.key", other_cert = dir + "/other.pem", other_key = dir + "/other.key";
+	self_signed(cert, key);
+	self_signed(other_cert, other_key);
+	CHECK(refusal(cert, key).empty());
+	{
+		const auto context = reactor::tls::server_context(reactor::tls::Options{cert, key, ""});
+		CHECK(SSL_CTX_get_num_tickets(context->native_handle()) == 0);   // strict
+		CHECK(SSL_CTX_get_session_cache_mode(context->native_handle()) == SSL_SESS_CACHE_OFF);
+		CHECK((SSL_CTX_get_options(context->native_handle()) & SSL_OP_NO_TICKET) != 0);
+		asio::ssl::context client(asio::ssl::context::tls);
+		reactor::tls::configure(client, reactor::tls::Options{"", "", cert}, reactor::tls::Role::Client);
+		CHECK(handshake(*context, client, "ECDHE-ECDSA-AES128-GCM-SHA256") == X509_V_OK);
+		CHECK(handshake(*context, client, "ECDHE-ECDSA-AES128-SHA") == -1);   // CBC refused: strict
+		const long left = reactor::tls::seconds_to_expiry(*context);
+		CHECK(left > 3500 && left <= 3600);
+		CHECK(std::chrono::seconds(left) < reactor::tls::expiry_warning);
+	}
+	::chmod(key.c_str(), 0640);
+	CHECK(contains(refusal(cert, key), "make it mode 0600"));   // group-readable
+	::chmod(key.c_str(), 0604);
+	CHECK(contains(refusal(cert, key), "make it mode 0600"));   // others-readable
+	::chmod(key.c_str(), 0600);
+	CHECK(contains(refusal(cert, dir + "/missing.key"), "cannot read TLS key"));
+	CHECK(contains(refusal(cert, other_key), "mismatch"));      // the pair
+	const std::string expired = dir + "/expired.pem", expired_key = dir + "/expired.key";
+	self_signed(expired, expired_key, false, -7200, -3600);
+	CHECK(contains(refusal(expired, expired_key), "has expired"));
+	const std::string future = dir + "/future.pem", future_key = dir + "/future.key";
+	self_signed(future, future_key, false, 3600, 7200);
+	CHECK(contains(refusal(future, future_key), "is not valid yet"));
+	// Thirty days left: past the warning. A context with no certificate has 0 left.
+	const std::string month = dir + "/month.pem", month_key = dir + "/month.key";
+	self_signed(month, month_key, false, 0, 30L * 86400);
+	{
+		const auto context = reactor::tls::server_context(reactor::tls::Options{month, month_key, ""});
+		const long left = reactor::tls::seconds_to_expiry(*context);
+		CHECK(left > 30L * 86400 - 100 && left <= 30L * 86400);
+		CHECK(std::chrono::seconds(left) >= reactor::tls::expiry_warning);
+		asio::ssl::context empty(asio::ssl::context::tls);
+		CHECK(reactor::tls::seconds_to_expiry(empty) == 0);
+	}
+	for (const auto& path : {cert, key, other_cert, other_key, expired, expired_key, future, future_key, month, month_key}) { std::remove(path.c_str()); }
+}
+
 static void basic(const std::string& dir_name) {
 	asio::ssl::context context(asio::ssl::context::tls);
 	CHECK(invalid([&] { reactor::tls::configure(context, Options{}, Role::Client); }));                                  // no authority
@@ -328,7 +397,7 @@ int main(int argc, char** argv) {
 	const std::string part = argc > 1 ? argv[1] : "";
 	char dir[] = "/tmp/reactor_tls_XXXXXX";
 	CHECK(::mkdtemp(dir) != nullptr);
-	const std::pair<const char*, void (*)(const std::string&)> parts[] = {{"basic", basic}, {"cache", cache}, {"rotation", rotation}, {"threads", threads}};
+	const std::pair<const char*, void (*)(const std::string&)> parts[] = {{"basic", basic}, {"server_context", server_context}, {"cache", cache}, {"rotation", rotation}, {"threads", threads}};
 	bool ran = false;
 	for (auto [name, run] : parts) {
 		if (part.empty() || part == name) {

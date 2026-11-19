@@ -3,7 +3,8 @@
 `reactor::tls::configure` (`reactor_tls.h`) reads the certificate, key and authority files on
 every call, and parses a file only when its bytes differ from the last parse of that path for
 that use. Unchanged files therefore load once however many contexts are configured from them,
-and a rotated file is what the next `configure` serves.
+and a rotated file is what the next `configure` serves. `server_context` builds through
+`configure`, so a server rebuilding its context on rotation gets the same cache.
 
 ## How it works
 

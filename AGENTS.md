@@ -69,11 +69,17 @@ docs/reactor.d2      The README and ARCHITECTURE diagram's source (docs/reactor.
 - **`TcpServer(reactors, admission_limit, session, maximum_connections = 0)`** — N reactors on
   N threads, each with an `AdmissionGate` of `admission_limit` requests in flight (0 => no cap).
   `set_bind_options()`, `set_shutdown_grace()` (5 s by default), `start(port)` (binds,
-  runs, returns). Teardown is task's four phases as calls: `stop()` (request every session's
-  token → grace → force → grace → stop → join), `close()` (close the reactors' schedulers),
+  runs, returns). Teardown is task's four phases as calls: `stop_accepting()` (close the listeners),
+  `wait_requests(token)` (block until every gate is at zero, or the token), `cancel_requests()`
+  (request every session's token), then `stop()` (those parts not yet run, then grace → force →
+  grace → stop → join; alone it stops accepting before it cancels), `close()` (close the reactors' schedulers),
   `destroy_roots()` (destroy the tasks still suspended), then destruction. The destructor runs
   any phase not yet run; a process with several servers or loops runs each phase on all of them
   before the next. `UdpServer` has the same three calls.
+- **`reactor::raise_open_files(wanted)`** raises the soft `RLIMIT_NOFILE` (never past the hard limit)
+  and returns the limit in force. **`reactor::tls::server_context(options)`** is the strict server
+  context, refusing a loose key or an invalid certificate; **`reactor::tls::seconds_to_expiry(context)`**
+  is the time left on its certificate.
 - **`Reactor::scheduler()`** — the loop's `task::asio_scheduler`; sessions, accept loops and the
   UDP receive loop are spawned on it, and tasks of the host can be too.
 - **`UdpServer(on_datagram)`** — one reactor + one bound UDP
@@ -111,7 +117,7 @@ docs/reactor.d2      The README and ARCHITECTURE diagram's source (docs/reactor.
   holds. A socket wait on neither ends only when `force()` shuts the connection down after the
   grace; any other such wait outlives `stop()` until `destroy_roots()` destroys it. Track and untrack on the reactor's loop only: the list is
   intrusive and unlocked, and `abort_all()` posts its walk to that loop.
-- **Shutdown order is abort → close and reap accepts → grace → force → grace → clear guards → stop → join** (`stop()`), then `close()`, then `destroy_roots()`; each runs the earlier phases not yet run. Don't reorder;
+- **Shutdown order is close and reap accepts → wait for requests (optional) → abort → grace → force → grace → clear guards → stop → join** (`stop()` runs it, skipping the parts already run and never waiting for requests), then `close()`, then `destroy_roots()`; each runs the earlier phases not yet run. Don't reorder;
   each step depends on the previous. `stop()` never waits on a session without bound. See `TcpServer::stop()`.
 - **The shared-acceptor path needs the work guards.** Idle reactors' `run()` returns
   immediately without them. Don't remove the `make_work_guard` loop.

@@ -46,6 +46,22 @@ phases not yet run, so the calls are safe in any order:
 3. `destroy_roots()`: the tasks still suspended are destroyed, with every `io_context` alive.
 4. Destruction: each scheduler, then its loop.
 
+Phase 1's parts are calls too, for a server that lets requests finish before cancelling them
+(Xapiand D2, D71). Each is idempotent, and `stop()` skips the parts already run:
+
+```cpp
+server.stop_accepting();                  // listeners closed: a new connection is refused
+bool idle = server.wait_requests(token);  // true when no request holds a gate; false at the token
+server.cancel_requests();                 // every session's token, as stop() asks
+server.stop();                            // the grace, force_connections(), the grace, join
+```
+
+`wait_requests` blocks the calling thread (never a loop) until every reactor's admission gate is
+at zero. It does not poll: the leave that brings a gate to zero wakes it. Requests on connections
+already open still enter the gates, so the token bounds the wait. `stop()` alone is
+`stop_accepting()`, `cancel_requests()`, the grace, `force_connections()` and the grace once
+more, then the join: it cancels requests in flight at once and never waits for them.
+
 The destructor runs every phase not yet run, which suffices when nothing else outlives the
 server. A process with several servers, pools or loops that tasks may be suspended on (a task on
 one server's scheduler may wait on another's timer) runs each phase on all of them before the
@@ -73,6 +89,19 @@ next; the `io_context` is not run again after phase 3.
   still tracked, which shuts each session's connection down and closes what a stalled peer
   holds, and waits the grace once more before it stops the loops. A session still running then
   is destroyed in `destroy_roots()`.
+
+## Descriptors and TLS for a server's main
+
+`reactor::raise_open_files(wanted)` raises the soft `RLIMIT_NOFILE` to `wanted`, never past the
+hard limit (nor macOS's `kern.maxfilesperproc`) and never down, and returns the soft limit in
+force. A server asks for its connection bound plus its own reserve before privileges drop; each
+served connection holds one descriptor (`test/test.cc` [P]).
+
+`reactor::tls::server_context(options)` (`reactor_tls.h`) is the context a server presents:
+`configure(Role::Server)` with `strict` set, after refusing a private key readable by group or
+others and a certificate not yet valid or expired. It throws `std::invalid_argument` naming the
+file. `reactor::tls::seconds_to_expiry(context)` is the time left on the presented certificate;
+a server warns while it is under `reactor::tls::expiry_warning` (14 days).
 
 ## Knowing you are on a loop
 

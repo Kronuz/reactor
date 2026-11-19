@@ -1,6 +1,9 @@
 // session_test -- the Session task, its cancel token and the task teardown: shutdown with sessions
-// mid-read and never started, admission refusals, the UDP receive loop, and the four phases across
-// servers in both orders. Every test ends with task::detail::live_frames() back at its baseline.
+// mid-read and never started, admission refusals, the UDP receive loop, the four phases across
+// servers in both orders, and the parts of stop() (stop_accepting, wait_requests, cancel_requests).
+// Every test ends with task::detail::live_frames() back at its baseline.
+
+#define REACTOR_TEST_HOOKS 1   // wait_requests' interleaving point
 
 #include <algorithm>
 #include <atomic>
@@ -611,6 +614,217 @@ static void phase_orders() {
 	check(clean == static_cast<int>(orders.size()), "[O] " + std::to_string(orders.size()) + " orders of the phase calls (tcp and udp): none hangs, the sessions end, no task frame is left");
 }
 
+// Requests on a connection: each byte the client sends is one, admitted through the reactor's gate
+// and answered "done\n" after `hold` on a timer that ignores the token, the lease released after the
+// reply. With `on_token`, a request instead waits on a read that takes the token, and records when
+// the token ended it.
+struct Requests {
+	std::chrono::milliseconds hold{300};
+	bool on_token = false;
+	std::atomic<int> entered{0}, completed{0}, cancelled{0};
+	std::atomic<long long> cancelled_ns{0};
+};
+static task::task<void> request_session(asio::ip::tcp::socket socket, Reactor& reactor, SessionContext context, Requests& requests) {
+	char byte = 0;
+	for (;;) {
+		const auto [error, n] = co_await test::read_some(socket, asio::buffer(&byte, 1), context.stop);
+		if (error || n == 0) { co_return; }
+		auto lease = reactor.gate().enter();
+		++requests.entered;
+		if (requests.on_token) {
+			const auto [held, unused] = co_await test::read_some(socket, asio::buffer(&byte, 1), context.stop);
+			if (held == asio::error::operation_aborted && context.stop.requested()) {
+				requests.cancelled_ns = std::chrono::steady_clock::now().time_since_epoch().count();
+				++requests.cancelled;
+			}
+			co_return;
+		}
+		asio::steady_timer timer(socket.get_executor(), requests.hold);
+		co_await test::wait_timer(timer);
+		static const char done[] = "done\n";
+		const auto [write_error, written] = co_await test::write_all(socket, asio::buffer(done, 5));
+		if (!write_error) { ++requests.completed; }
+		lease.reset();
+	}
+}
+static reactor::Session requests_session(Requests& requests) {
+	return [&requests](asio::ip::tcp::socket socket, Reactor& reactor, SessionContext context) {
+		return request_session(std::move(socket), reactor, std::move(context), requests);
+	};
+}
+static int send_request(unsigned short port) {
+	const int fd = test::connect_port(port);
+	if (fd >= 0) { (void)::send(fd, "r", 1, 0); }
+	return fd;
+}
+static std::string read_line(int fd) {
+	std::string out;
+	char c = 0;
+	while (::recv(fd, &c, 1, 0) == 1) { out.push_back(c); if (c == '\n') { break; } }
+	return out;
+}
+
+// [W] After stop_accepting() a new connection is refused while the request in flight completes, and
+// wait_requests returns true once it has; then stop() runs the rest.
+static void stop_accepting_lets_requests_finish() {
+	const auto base = task::detail::live_frames();
+	for (const std::size_t reactors : {std::size_t{1}, std::size_t{2}}) {
+		Requests requests;
+		reactor::TcpServer server(reactors, 0, requests_session(requests));
+		const auto port = test::free_port();
+		server.start(port);
+		const int fd = send_request(port);
+		wait_for([&] { return requests.entered.load() == 1; });
+		const auto began = std::chrono::steady_clock::now();
+		server.stop_accepting();
+		const int refused = test::connect_port(port);
+		check(refused == -1, "[W] a new connection is refused after stop_accepting()");
+		if (refused >= 0) { ::close(refused); }
+		bool idle = false;
+		returns_within("[W] wait_requests", 5000ms, [&] { idle = server.wait_requests({}); });
+		const double waited = ms_since(began);
+		std::printf("     %zu reactor(s): wait_requests returned after %.0f ms (the request holds 300 ms)\n", reactors, waited);
+		check(idle && requests.completed == 1 && requests.cancelled == 0 && waited >= 250.0,
+			"[W] wait_requests returns true when the request in flight has completed, uncancelled");
+		check(read_line(fd) == "done\n", "[W] the client in flight gets its reply after stop_accepting()");
+		check(server.reactor(0).gate().inflight == 0, "[W] no request holds the gate after wait_requests");
+		returns_within("[W] stop", 5000ms, [&] { server.stop(); });
+		if (fd >= 0) { ::close(fd); }
+	}
+	check(task::detail::live_frames() == base, "[W] no task frame is left");
+}
+
+// [K] wait_requests returns false when its token is requested first, and true once
+// cancel_requests() ends the request; an already-requested token returns at once.
+static void wait_requests_token() {
+	const auto base = task::detail::live_frames();
+	{
+		Requests requests;
+		requests.on_token = true;
+		reactor::TcpServer server(1, 0, requests_session(requests));
+		const auto port = test::free_port();
+		server.start(port);
+		const int fd = send_request(port);
+		wait_for([&] { return requests.entered.load() == 1; });
+		server.stop_accepting();
+		task::cancel_source source;   // its state is a pooled block too, alive until the scope ends
+		std::thread requester([&] { std::this_thread::sleep_for(100ms); source.request(); });
+		const auto began = std::chrono::steady_clock::now();
+		bool idle = true;
+		returns_within("[K] wait_requests(token)", 5000ms, [&] { idle = server.wait_requests(source.token()); });
+		const double waited = ms_since(began);
+		requester.join();
+		check(!idle && waited >= 90.0 && waited < 2000.0 && server.reactor(0).gate().inflight == 1,
+			"[K] wait_requests returns false at its token, the request still in flight");
+		returns_within("[K] wait_requests(requested)", 1000ms, [&] { idle = server.wait_requests(source.token()); });
+		check(!idle, "[K] a token already requested returns false at once while a request is in flight");
+		server.cancel_requests();
+		returns_within("[K] wait_requests after cancel", 5000ms, [&] { idle = server.wait_requests({}); });
+		check(idle && requests.cancelled == 1, "[K] cancel_requests() ends the request; wait_requests returns true");
+		returns_within("[K] wait_requests(requested) idle", 1000ms, [&] { idle = server.wait_requests(source.token()); });
+		check(idle, "[K] with no request in flight a requested token still returns true");
+		server.stop();
+		if (fd >= 0) { ::close(fd); }
+	}
+	check(task::detail::live_frames() == base, "[K] no task frame is left");
+}
+
+// [H] The last leave lands between wait_requests' read of the gates and its wait (the hook): the
+// leave's wake takes the drain's mutex, so it waits for the waiter to sleep and wakes it. A wake
+// that does not lock is lost there, and the wait lasts until the 2 s token.
+namespace hook {
+reactor::AdmissionGate* gate = nullptr;
+std::thread leaver;
+bool fired = false;
+void last_leave() {
+	if (std::exchange(fired, true)) { return; }
+	leaver = std::thread([] { gate->leave(); });
+	wait_for([] { return gate->inflight.load() == 0; }, 1000ms);
+	std::this_thread::sleep_for(20ms);   // a wake that does not lock has notified by now
+}
+}  // namespace hook
+static void wait_requests_last_leave_hook() {
+	for (int round = 0; round != 5; ++round) {
+		reactor::TcpServer server(1, 0, [](asio::ip::tcp::socket, Reactor&, SessionContext) -> task::task<void> { co_return; });
+		hook::gate = &server.reactor(0).gate();
+		hook::fired = false;
+		check(hook::gate->try_enter(), "[H] a request enters the gate");
+		task::cancel_source source;
+		std::atomic<bool> finished{false};
+		std::thread requester([&] {
+			for (int i = 0; i != 200 && !finished.load(); ++i) { std::this_thread::sleep_for(10ms); }
+			source.request();
+		});
+		reactor::detail::test_hooks::wait_requests_checked = &hook::last_leave;
+		const auto began = std::chrono::steady_clock::now();
+		const bool idle = server.wait_requests(source.token());
+		const double waited = ms_since(began);
+		reactor::detail::test_hooks::wait_requests_checked = nullptr;
+		finished = true;
+		requester.join();
+		hook::leaver.join();
+		check(hook::fired && idle && waited < 1000.0,
+			"[H] round " + std::to_string(round) + ": a last leave between the read and the wait wakes wait_requests (" +
+			std::to_string(static_cast<int>(waited)) + " ms)");
+	}
+}
+
+// [R] Concurrent leaves against wait_requests (for TSan): threads enter and leave both gates while
+// the waiter waits; every round returns true once they are done, never hanging on a lost wake.
+static void wait_requests_races() {
+	int rounds_ok = 0;
+	returns_within("[R] wait_requests races", 60000ms, [&] {
+		for (int round = 0; round != 200; ++round) {
+			reactor::TcpServer server(2, 0, [](asio::ip::tcp::socket, Reactor&, SessionContext) -> task::task<void> { co_return; });
+			std::atomic<int> left{0};
+			std::vector<std::thread> threads;
+			for (int t = 0; t != 4; ++t) {
+				threads.emplace_back([&server, &left, t, round] {
+					auto& gate = server.reactor(static_cast<std::size_t>(t & 1)).gate();
+					for (int i = 0; i != 50; ++i) {
+						auto lease = gate.enter();
+						if ((i + round) % 7 == 0) { std::this_thread::yield(); }
+					}
+					++left;
+				});
+			}
+			while (left.load() != 4) { (void)server.wait_requests({}); }
+			for (auto& thread : threads) { thread.join(); }
+			if (server.wait_requests({}) && server.reactor(0).gate().inflight == 0 && server.reactor(1).gate().inflight == 0) { ++rounds_ok; }
+		}
+	});
+	check(rounds_ok == 200, "[R] 200 rounds of concurrent leaves: wait_requests returns true each time");
+}
+
+// [L] The legacy stop() cancels a request in flight at once: it does not wait for requests. The
+// client closes after 2 s, so a stop() that waited would see the request end then, uncancelled.
+static void legacy_stop_cancels_at_once() {
+	const auto base = task::detail::live_frames();
+	Requests requests;
+	requests.on_token = true;
+	reactor::TcpServer server(1, 0, requests_session(requests));
+	server.set_shutdown_grace(3000ms);
+	const auto port = test::free_port();
+	server.start(port);
+	const int fd = send_request(port);
+	wait_for([&] { return requests.entered.load() == 1; });
+	std::promise<void> stopped;
+	std::thread closer([&fd, future = stopped.get_future()] {
+		if (future.wait_for(2000ms) != std::future_status::ready) { ::shutdown(fd, SHUT_WR); }
+	});
+	const auto began = std::chrono::steady_clock::now();
+	const double took = returns_within("[L] stop()", 10000ms, [&] { server.stop(); });
+	stopped.set_value();
+	closer.join();
+	const double cancelled_after = std::chrono::duration<double, std::milli>(
+		std::chrono::steady_clock::time_point(std::chrono::steady_clock::duration(requests.cancelled_ns.load())) - began).count();
+	std::printf("     stop() returned after %.0f ms, the request cancelled after %.0f ms\n", took, requests.cancelled == 1 ? cancelled_after : -1.0);
+	check(requests.cancelled == 1 && cancelled_after < 1000.0, "[L] stop() cancels the request in flight at once");
+	check(took < 1500.0, "[L] stop() returns without waiting for the request or the grace");
+	if (fd >= 0) { ::close(fd); }
+	check(task::detail::live_frames() == base, "[L] no task frame is left");
+}
+
 int main() {
 	std::setvbuf(stdout, nullptr, _IOLBF, 0);
 	std::printf("== reactor session test ==\n");
@@ -630,6 +844,11 @@ int main() {
 	force_spares_a_reused_descriptor();
 	cross_server_stop_orders();
 	phase_orders();
+	stop_accepting_lets_requests_finish();
+	wait_requests_token();
+	wait_requests_last_leave_hook();
+	wait_requests_races();
+	legacy_stop_cancels_at_once();
 	std::printf("\n%s (%d failures)\n", g_fail == 0 ? "PASS" : "FAIL", g_fail);
 	return g_fail == 0 ? 0 : 1;
 }
