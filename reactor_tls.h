@@ -28,7 +28,10 @@
 #include <asio/ip/address.hpp>
 #include <asio/ssl.hpp>
 #include <openssl/x509.h>
+#include <sys/stat.h>
 
+#include <chrono>
+#include <memory>
 #include <stdexcept>
 #include <string>
 
@@ -83,6 +86,47 @@ inline void configure(asio::ssl::context& context, const Options& options, Role 
 	context.set_verify_mode(role == Role::Peer ? asio::ssl::verify_peer | asio::ssl::verify_fail_if_no_peer_cert
 		: role == Role::Client                 ? asio::ssl::verify_peer
 											   : asio::ssl::verify_none);
+}
+
+// A server logs a warning while its certificate expires within this (seconds_to_expiry).
+inline constexpr std::chrono::seconds expiry_warning{14 * 24 * 3600};
+
+// The context a server presents: configure() for Role::Server with `strict` set, after refusing a
+// private key readable by group or others (checked before the key is read) and a certificate not
+// yet valid or expired. Throws std::invalid_argument naming the file, for a file it cannot read or a
+// pair that does not match too. Read the key before privileges drop.
+inline std::shared_ptr<asio::ssl::context> server_context(Options options) {
+	if (!options.private_key.empty()) {
+		struct stat st {};
+		if (::stat(options.private_key.c_str(), &st) != 0) { throw std::invalid_argument("cannot read TLS key " + options.private_key); }
+		if ((st.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
+			throw std::invalid_argument("TLS key " + options.private_key + " is readable by group or others; make it mode 0600");
+		}
+	}
+	options.strict = true;
+	auto context = std::make_shared<asio::ssl::context>(asio::ssl::context::tls);
+	try {
+		configure(*context, options, Role::Server);
+	} catch (const std::exception& e) {
+		throw std::invalid_argument("TLS certificate " + options.certificate + " or key " + options.private_key + ": " + e.what());
+	}
+	X509* presented = SSL_CTX_get0_certificate(context->native_handle());
+	if (presented == nullptr) { throw std::invalid_argument("TLS certificate " + options.certificate + " holds no certificate"); }
+	if (X509_cmp_current_time(X509_get0_notBefore(presented)) > 0) {
+		throw std::invalid_argument("TLS certificate " + options.certificate + " is not valid yet");
+	}
+	if (X509_cmp_current_time(X509_get0_notAfter(presented)) < 0) {
+		throw std::invalid_argument("TLS certificate " + options.certificate + " has expired");
+	}
+	return context;
+}
+
+// Seconds until the certificate `context` presents expires, negative once it has; 0 without one.
+inline long seconds_to_expiry(asio::ssl::context& context) {
+	const X509* presented = SSL_CTX_get0_certificate(context.native_handle());
+	int days = 0, seconds = 0;
+	if (presented == nullptr || ASN1_TIME_diff(&days, &seconds, nullptr, X509_get0_notAfter(presented)) != 1) { return 0; }
+	return long(days) * 86400 + seconds;
 }
 
 // A client connection verifies the server's chain against the name it asked for: an IP

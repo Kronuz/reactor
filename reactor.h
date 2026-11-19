@@ -61,7 +61,11 @@
 extern "C" void pthread_set_name_np(pthread_t, const char*);
 #endif
 #include <netinet/in.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
+#if defined(__APPLE__)
+#  include <sys/sysctl.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -74,6 +78,7 @@ extern "C" void pthread_set_name_np(pthread_t, const char*);
 #include <string>
 #include <string_view>
 #include <stdexcept>
+#include <system_error>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -155,6 +160,31 @@ struct RunScope {
 	RunScope& operator=(const RunScope&) = delete;
 };
 
+// Test-only interleaving points, compiled in when REACTOR_TEST_HOOKS is defined.
+#ifdef REACTOR_TEST_HOOKS
+namespace detail::test_hooks {
+inline thread_local void (*wait_requests_checked)() = nullptr;  // wait_requests, between reading the gates and the wait
+}  // namespace detail::test_hooks
+#define REACTOR_TEST_HOOK(name) \
+	do { \
+		if (auto* hook_ = ::reactor::detail::test_hooks::name) { hook_(); } \
+	} while (0)
+#else
+#define REACTOR_TEST_HOOK(name) ((void)0)
+#endif
+
+// Where TcpServer::wait_requests sleeps. Once `armed`, the leave that brings a gate to zero takes
+// the mutex and notifies; the waiter reads the gates under the mutex, so no such leave is lost.
+struct RequestDrain {
+	std::atomic<bool> armed{false};
+	std::mutex mutex;
+	std::condition_variable changed;
+	void wake() {
+		std::lock_guard lock(mutex);
+		changed.notify_all();
+	}
+};
+
 // Bounded admission: a window so a saturated reactor sheds load instead of growing an
 // unbounded backlog. try_enter() returning false is the "busy" signal (the caller answers
 // with whatever its protocol uses -- an HTTP 503, a NAK, a drop). A limit of 0 or less
@@ -163,16 +193,23 @@ struct AdmissionGate {
 	std::atomic<int> inflight{0};
 	std::atomic<unsigned long long> rejected{0};
 	int limit;
+	RequestDrain* drain = nullptr;   // set before the loops run (TcpServer); the last leave wakes it once armed
 	explicit AdmissionGate(int limit_) : limit(limit_) {}
 	bool try_enter() {
 		if (inflight.fetch_add(1, std::memory_order_relaxed) >= limit && limit > 0) {
-			inflight.fetch_sub(1, std::memory_order_relaxed);
+			leave();
 			rejected.fetch_add(1, std::memory_order_relaxed);
 			return false;
 		}
 		return true;
 	}
-	void leave() { inflight.fetch_sub(1, std::memory_order_relaxed); }
+	// Sequentially consistent with the armed flag, against wait_requests' store then reads: either this
+	// leave sees the flag and wakes the waiter, or the waiter reads the count it left.
+	void leave() {
+		if (inflight.fetch_sub(1, std::memory_order_seq_cst) == 1 && drain && drain->armed.load(std::memory_order_seq_cst)) {
+			drain->wake();
+		}
+	}
 
 	// A move-only admission held for the duration of the work; false when refused.
 	class Lease {
@@ -679,6 +716,35 @@ inline task::task<void> shared_accept_loop(std::vector<Reactor*> reactors, const
 
 }  // namespace detail
 
+// Raises the soft open-files limit (RLIMIT_NOFILE) to `wanted`, or as far toward the hard limit as
+// the system allows (macOS also caps it at kern.maxfilesperproc); never lowers it. Returns the soft
+// limit in force, SIZE_MAX for none. A server asks for its connection bound plus its own reserve,
+// before privileges drop, and decides what to do when the answer is short.
+inline std::size_t raise_open_files(std::size_t wanted) {
+	const auto in_force = [](rlim_t value) noexcept {
+		return value == RLIM_INFINITY || value > SIZE_MAX ? SIZE_MAX : static_cast<std::size_t>(value);
+	};
+	rlimit limit{};
+	if (::getrlimit(RLIMIT_NOFILE, &limit) != 0) { throw std::system_error(errno, std::generic_category(), "getrlimit(RLIMIT_NOFILE)"); }
+	if (limit.rlim_cur == RLIM_INFINITY || static_cast<rlim_t>(wanted) <= limit.rlim_cur) { return in_force(limit.rlim_cur); }
+	rlim_t target = static_cast<rlim_t>(wanted);
+	if (limit.rlim_max != RLIM_INFINITY) { target = std::min(target, limit.rlim_max); }
+#if defined(__APPLE__)
+	int per_process = 0;
+	std::size_t size = sizeof(per_process);
+	if (::sysctlbyname("kern.maxfilesperproc", &per_process, &size, nullptr, 0) == 0 && per_process > 0) {
+		target = std::min(target, static_cast<rlim_t>(per_process));
+	}
+#endif
+	if (target > limit.rlim_cur) {
+		rlimit raised = limit;
+		raised.rlim_cur = target;
+		(void)::setrlimit(RLIMIT_NOFILE, &raised);   // refused: the limit in force stays, and is returned
+		if (::getrlimit(RLIMIT_NOFILE, &limit) != 0) { throw std::system_error(errno, std::generic_category(), "getrlimit(RLIMIT_NOFILE)"); }
+	}
+	return in_force(limit.rlim_cur);
+}
+
 // A TCP server: N reactors on N threads, all bound to one port, running the Session
 // task per accepted connection. Construct it with the reactor count, the per-reactor
 // admission limit (0 => none), the Session, and the optional bound on live connections; set
@@ -700,6 +766,7 @@ public:
 		set_connection_limit(maximum_connections);
 		for (std::size_t i = 0; i < n_; ++i) {
 			reactors_.push_back(std::make_unique<Reactor>(admission_limit));
+			reactors_.back()->gate().drain = &drain_;
 		}
 	}
 
@@ -736,7 +803,7 @@ public:
 	// Bind + run all reactors (each on its own thread). Returns once the threads are
 	// listening; bind/listen errors propagate after cleanup. stop() tears down.
 	void start(unsigned short port) {
-		if (started_ || stopped_) { throw std::logic_error("TCP server cannot be restarted"); }
+		if (started_ || stopped_ || accepting_stopped_) { throw std::logic_error("TCP server cannot be restarted"); }
 		started_ = true;
 		try {
 		bool shared = !bind_.reuse_port && reactors_.size() > 1;
@@ -784,25 +851,17 @@ public:
 		}
 	}
 
-	// Phase 1, bounded: request every session's token and end the accept loops; sessions get the
-	// grace to finish, then force() runs on what is still tracked (each session's connection is shut
-	// down, which ends any wait on its socket) and they get the grace once more; then the loops
-	// stop and join. A session still running then (one waiting on another server's loop) is
-	// destroyed in phase 3. Idempotent.
+	// Phase 1, bounded, as its parts below: stop_accepting(), cancel_requests(), the grace for the
+	// sessions to finish, force_connections() on what is left and the grace once more; then the loops
+	// stop and join. It does not wait for requests (wait_requests() is the caller's). A session still
+	// running then (one waiting on another server's loop) is destroyed in phase 3. Idempotent.
 	void stop() {
 		if (stopped_) { return; }
 		stopped_ = true;
-		for (auto& r : reactors_) { r->abort_all(); }   // stage one: every tracked request is asked to stop
-		for (auto& control : accepts_) {
-			control->stopping.store(true);
-			asio::post(control->executor, [control] { control->stop_on_owner(); });
-		}
-		// Cancel submission is not completion. Reap every accept while all peer
-		// socket services remain alive, then preserve the existing shutdown tail.
-		for (auto& control : accepts_) { control->wait(); }
-		// Stage two: sessions get the grace to finish; what a stalled peer still holds is forced.
+		stop_accepting();
+		cancel_requests();
 		if (!sessions_end_within(grace_)) {
-			for (auto& r : reactors_) { r->force_all(); }
+			force_connections();
 			sessions_end_within(grace_);
 		}
 		guards_.clear();
@@ -811,6 +870,44 @@ public:
 		threads_.clear();
 		accepts_.clear();
 	}
+
+	// The parts of stop() a caller runs itself, to let requests finish before cancelling them:
+	// stop_accepting(), wait_requests(token), cancel_requests(), then stop(). Call them from outside
+	// the loops, from one thread; each is idempotent and stop() skips what already ran.
+
+	// Closes every listener and returns once each accept loop has ended: a new connection is refused,
+	// while the connections already accepted go on being served.
+	void stop_accepting() {
+		if (accepting_stopped_) { return; }
+		accepting_stopped_ = true;
+		for (auto& control : accepts_) {
+			control->stopping.store(true);
+			asio::post(control->executor, [control] { control->stop_on_owner(); });
+		}
+		// Cancel submission is not completion: reap every accept while all peer socket services live.
+		for (auto& control : accepts_) { control->wait(); }
+	}
+	// Blocks until no request holds a reactor's admission gate, and returns true; false when `token`
+	// is requested first. No poll: the leave that brings a gate to zero wakes it. Requests on open
+	// connections still enter the gates, so the caller bounds the wait with the token.
+	bool wait_requests(const task::cancel_token& token) {
+		assert(!inside_run());
+		drain_.armed.store(true, std::memory_order_seq_cst);   // from here every last leave wakes the drain
+		task::cancel_callback cancelled(token, [this] { drain_.wake(); });
+		std::unique_lock lock(drain_.mutex);
+		for (;;) {
+			const bool idle = requests_idle();
+			REACTOR_TEST_HOOK(wait_requests_checked);
+			if (idle) { return true; }
+			if (token.requested()) { return false; }
+			drain_.changed.wait(lock);
+		}
+	}
+	// Requests every session's token (Abortable::abort() on every tracked wait, on its loop).
+	void cancel_requests() { for (auto& r : reactors_) { r->abort_all(); } }
+	// Shuts down what is still tracked (Abortable::force(): each session's connection), on its loop.
+	void force_connections() { for (auto& r : reactors_) { r->force_all(); } }
+
 	// Phase 2, after every loop a task may be suspended on has stopped (runs stop() if it has not
 	// run): the schedulers drop what is posted to them and destroy what is spawned on them.
 	void close() {
@@ -825,6 +922,12 @@ public:
 	}
 
 private:
+	bool requests_idle() const noexcept {
+		for (const auto& r : reactors_) {
+			if (r->gate().inflight.load(std::memory_order_seq_cst) != 0) { return false; }
+		}
+		return true;
+	}
 	// True when every session ended within `limit`.
 	bool sessions_end_within(std::chrono::milliseconds limit) {
 		const auto deadline = std::chrono::steady_clock::now() + limit;
@@ -833,7 +936,8 @@ private:
 		return drained;
 	}
 
-	bool started_ = false, stopped_ = false;
+	bool started_ = false, stopped_ = false, accepting_stopped_ = false;
+	RequestDrain drain_;   // before reactors_: their gates point at it
 	unsigned short port_ = 0;
 	bool lag_probe_ = false;
 	std::vector<std::shared_ptr<detail::AcceptControl>> accepts_;

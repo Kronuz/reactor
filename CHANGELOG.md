@@ -6,6 +6,31 @@ entries are dated.
 
 Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://github.com/Kronuz/cpp-libraries/blob/main/docs/UPGRADING-2026-10.md#reactor) lists what changes for callers, how to find affected inputs, the commits not to pin, and the speedup.
 
+## 2026-11-19
+
+### Added
+
+- `TcpServer` exposes the parts of `stop()` as calls (Xapiand D2): `stop_accepting()` closes the
+  listeners (a new connection is refused, open ones are served), `wait_requests(token)` blocks
+  until no request holds a reactor's admission gate (true) or the token is requested (false),
+  woken by the leave that brings a gate to zero, `cancel_requests()` requests every session's
+  token and `force_connections()` shuts down what is still tracked. Each is idempotent; `stop()`
+  skips the parts already run.
+- `reactor::raise_open_files(wanted)`: raises the soft `RLIMIT_NOFILE` toward `wanted` within the
+  hard limit, never lowers it, and returns the limit in force.
+- `reactor::tls::server_context(options)`: the server context with `strict` set, refusing a key
+  readable by group or others and a certificate not yet valid or expired (Xapiand's `tls_setup`
+  checks); `reactor::tls::seconds_to_expiry(context)` and `reactor::tls::expiry_warning` (14 days).
+- `REACTOR_TEST_HOOKS` compiles in test-only interleaving points (`wait_requests_checked`).
+
+### Changed
+
+- `stop()` stops accepting before it requests the sessions' tokens; it still cancels requests in
+  flight at once and never waits for them.
+- `AdmissionGate::leave()` is sequentially consistent and, once a server's `wait_requests` armed
+  its drain, wakes it on the last leave; a refused `try_enter` gives its slot back through
+  `leave()`.
+
 ## 2026-11-17
 
 ### Removed
