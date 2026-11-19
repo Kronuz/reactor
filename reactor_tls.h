@@ -88,6 +88,16 @@ inline void configure(asio::ssl::context& context, const Options& options, Role 
 											   : asio::ssl::verify_none);
 }
 
+namespace detail {
+// Seconds from now until `when`, negative when it has passed; false when the time is unreadable.
+inline bool seconds_until(const ASN1_TIME* when, long& seconds) {
+	int days = 0, rest = 0;
+	if (ASN1_TIME_diff(&days, &rest, nullptr, when) != 1) { return false; }
+	seconds = long(days) * 86400 + rest;
+	return true;
+}
+}  // namespace detail
+
 // A server logs a warning while its certificate expires within this (seconds_to_expiry).
 inline constexpr std::chrono::seconds expiry_warning{14 * 24 * 3600};
 
@@ -112,10 +122,11 @@ inline std::shared_ptr<asio::ssl::context> server_context(Options options) {
 	}
 	X509* presented = SSL_CTX_get0_certificate(context->native_handle());
 	if (presented == nullptr) { throw std::invalid_argument("TLS certificate " + options.certificate + " holds no certificate"); }
-	if (X509_cmp_current_time(X509_get0_notBefore(presented)) > 0) {
+	long left = 0;
+	if (!detail::seconds_until(X509_get0_notBefore(presented), left) || left > 0) {
 		throw std::invalid_argument("TLS certificate " + options.certificate + " is not valid yet");
 	}
-	if (X509_cmp_current_time(X509_get0_notAfter(presented)) < 0) {
+	if (!detail::seconds_until(X509_get0_notAfter(presented), left) || left < 0) {
 		throw std::invalid_argument("TLS certificate " + options.certificate + " has expired");
 	}
 	return context;
@@ -124,9 +135,9 @@ inline std::shared_ptr<asio::ssl::context> server_context(Options options) {
 // Seconds until the certificate `context` presents expires, negative once it has; 0 without one.
 inline long seconds_to_expiry(asio::ssl::context& context) {
 	const X509* presented = SSL_CTX_get0_certificate(context.native_handle());
-	int days = 0, seconds = 0;
-	if (presented == nullptr || ASN1_TIME_diff(&days, &seconds, nullptr, X509_get0_notAfter(presented)) != 1) { return 0; }
-	return long(days) * 86400 + seconds;
+	long left = 0;
+	if (presented == nullptr || !detail::seconds_until(X509_get0_notAfter(presented), left)) { return 0; }
+	return left;
 }
 
 // A client connection verifies the server's chain against the name it asked for: an IP
