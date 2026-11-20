@@ -65,13 +65,9 @@ static task::task<void> echo_session(asio::ip::tcp::socket socket, reactor::Reac
 }
 
 // ---- tiny blocking client ----
-static unsigned short free_port() {
-	int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-	sockaddr_in a{}; a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_LOOPBACK); a.sin_port = 0;
-	::bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a));
-	socklen_t len = sizeof(a); ::getsockname(fd, reinterpret_cast<sockaddr*>(&a), &len);
-	unsigned short p = ntohs(a.sin_port); ::close(fd); return p;
-}
+// Binds the kernel's own port (start(0)): a port reserved by one socket and released for another to
+// bind is a window in which any other process can take it.
+static unsigned short listen_any(reactor::TcpServer& service) { service.start(0); return service.port(); }
 static int connect_port(unsigned short port) {
 	int fd = ::socket(AF_INET, SOCK_STREAM, 0);
 	sockaddr_in a{}; a.sin_family = AF_INET; a.sin_port = htons(port);
@@ -126,7 +122,7 @@ static void bounded_queued_connections() {
 	auto observer = service.connection_observer();
 	check(observer && observer->stats().active == 0, "shared observer starts with no original sessions");
 	reactor::BindOptions bind; bind.address = "127.0.0.1"; service.set_bind_options(bind);
-	auto port = free_port(); service.start(port);
+	auto port = listen_any(service);
 	std::promise<void> entered, release;
 	auto released = release.get_future().share();
 	asio::post(service.reactor(1).io(), [&] { entered.set_value(); released.wait(); });
@@ -154,7 +150,7 @@ static void bounded_shared_acceptors() {
 		});
 		service.set_connection_limit(3);
 		reactor::BindOptions bind; bind.address = "127.0.0.1"; bind.reuse_port = reuse; service.set_bind_options(bind);
-		auto port = free_port(); service.start(port);
+		auto port = listen_any(service);
 		std::vector<int> clients;
 		for (unsigned i = 0; i < 64; ++i) { clients.push_back(connect_port(port)); }
 		auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
@@ -204,9 +200,8 @@ static void run_marker() {
 		std::string reply = "done\n";
 		co_await test::write_all(socket, asio::buffer(reply));
 	};
-	unsigned short port = free_port();
 	reactor::TcpServer svc(1, 8, probe);
-	svc.start(port); wait_listen(port);
+	const auto port = listen_any(svc); wait_listen(port);
 	session_loop = -1;
 	round_trip(port, "x");
 	svc.stop();
@@ -339,8 +334,7 @@ static void force_after_grace() {
 	};
 	reactor::TcpServer svc(1, 8, session);
 	svc.set_shutdown_grace(std::chrono::milliseconds(150));
-	unsigned short port = free_port();
-	svc.start(port); wait_listen(port);
+	const auto port = listen_any(svc); wait_listen(port);
 	std::this_thread::sleep_for(std::chrono::milliseconds(50));   // the probe connections have ended
 	const int base = shared.started.load();
 	int fd = connect_port(port);
@@ -423,8 +417,7 @@ static void descriptors_per_connection() {
 		[counts](asio::ip::tcp::socket socket, reactor::Reactor&, reactor::SessionContext context) {
 			return idle_session(std::move(socket), counts, context.stop);
 		});
-	const auto port = free_port();
-	service.start(port);
+	const auto port = listen_any(service);
 	const int before = open_descriptors();
 	std::vector<int> clients;
 	for (int i = 0; i != 64; ++i) { clients.push_back(connect_port(port)); }
@@ -452,10 +445,9 @@ static void accept_survives_reset() {
 	      "[N] a bad listener is fatal; descriptor exhaustion backs off");
 
 	for (bool reuse : {false, true}) {
-		unsigned short port = free_port();
 		reactor::TcpServer svc(2, 100, echo_session);
 		if (reuse) { reactor::BindOptions b; b.reuse_port = true; svc.set_bind_options(b); }
-		svc.start(port); wait_listen(port);
+		const auto port = listen_any(svc); wait_listen(port);
 		for (int i = 0; i < 1500; ++i) {
 			int fd = ::socket(AF_INET, SOCK_STREAM, 0);
 			sockaddr_in a{}; a.sin_family = AF_INET; a.sin_port = htons(port); ::inet_pton(AF_INET, "127.0.0.1", &a.sin_addr);
@@ -499,9 +491,8 @@ int main() {
 
 	// [A] one reactor, many clients.
 	{
-		unsigned short port = free_port();
 		reactor::TcpServer svc(1, 64, echo_session);
-		svc.start(port); wait_listen(port);
+		const auto port = listen_any(svc); wait_listen(port);
 		int ok = serve_count(port, 30);
 		std::printf("  [A] 1 reactor -> %d/30 echoed\n", ok);
 		check(ok == 30, "single reactor serves every client");
@@ -509,18 +500,16 @@ int main() {
 
 	// [B] N reactors, SO_REUSEPORT and the portable shared-acceptor.
 	{
-		unsigned short port = free_port();
 		reactor::TcpServer svc(4, 64, echo_session);
 		reactor::BindOptions b; b.reuse_port = true; svc.set_bind_options(b);
-		svc.start(port); wait_listen(port);
+		const auto port = listen_any(svc); wait_listen(port);
 		int ok = serve_count(port, 40);
 		std::printf("  [B] 4 reactors reuse_port -> %d/40 echoed\n", ok);
 		check(ok == 40, "reuse_port: all served across shared-nothing reactors");
 	}
 	{
-		unsigned short port = free_port();
 		reactor::TcpServer svc(4, 64, echo_session);   // reuse_port off -> shared acceptor
-		svc.start(port); wait_listen(port);
+		const auto port = listen_any(svc); wait_listen(port);
 		int ok = serve_count(port, 40);
 		std::printf("  [B] 4 reactors shared-acceptor -> %d/40 echoed\n", ok);
 		check(ok == 40, "shared acceptor: all served (portable path)");
@@ -536,7 +525,6 @@ int main() {
 			std::atomic<bool>& flag_;
 		};
 		std::atomic<bool> aborted{false};
-		unsigned short port = free_port();
 		reactor::Session waiting = [&aborted](asio::ip::tcp::socket, reactor::Reactor& r, reactor::SessionContext) -> task::task<void> {
 			Wait wait(r.io(), aborted);
 			r.track(wait);
@@ -544,7 +532,7 @@ int main() {
 			r.untrack(wait);
 		};
 		auto* svc = new reactor::TcpServer(1, 64, waiting);
-		svc->start(port); wait_listen(port);
+		const auto port = listen_any(*svc); wait_listen(port);
 		int fd = connect_port(port);   // starts a session that waits an hour
 		std::this_thread::sleep_for(std::chrono::milliseconds(60));
 		std::atomic<bool> stopped{false};
@@ -559,15 +547,14 @@ int main() {
 
 	// Reap a pending shared accept for every round-robin destination.
 	for (unsigned count = 0; count != 5; ++count) {
-		auto port = free_port();
 		reactor::TcpServer service(4, 0, echo_session);
-		service.start(port); wait_listen(port);
+		const auto port = listen_any(service); wait_listen(port);
 		for (unsigned index = 0; index != count; ++index) { check(round_trip(port, "pending") == "echo: pending", "shared accept destination reached before retirement"); }
 		service.stop(); service.stop();
 	}
 	for (unsigned count = 0; count != 20; ++count) {
 		reactor::TcpServer service(4, 0, echo_session);
-		service.start(free_port()); service.stop();
+		service.start(0); service.stop();
 	}
 	{
 		struct Reentrant : reactor::Abortable {
@@ -600,7 +587,7 @@ int main() {
 			reactor::TcpServer service(reactors, 0, echo_session);
 			reactor::BindOptions bind; bind.address = "127.0.0.1"; bind.reuse_port = reuse;
 			service.set_bind_options(bind);
-			const auto port = free_port(); service.start(port);
+			const auto port = listen_any(service);
 			asio::io_context io; asio::ip::tcp::socket socket(io); asio::error_code error;
 			socket.connect({asio::ip::address_v4::loopback(), port}, error);
 			check(!error, "start returns only after a listener accepts immediate connections");
@@ -613,7 +600,7 @@ int main() {
 			[counts](asio::ip::tcp::socket socket, reactor::Reactor&, reactor::SessionContext context) {
 				return idle_session(std::move(socket), counts, context.stop);
 			});
-		auto port = free_port(); service.start(port); wait_listen(port);
+		const auto port = listen_any(service); wait_listen(port);
 		std::vector<int> clients;
 		for (unsigned i = 0; i != 16; ++i) { clients.push_back(connect_port(port)); }
 		for (unsigned i = 0; i != 200 && counts->started.load() < 16; ++i) {
