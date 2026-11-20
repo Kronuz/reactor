@@ -453,8 +453,9 @@ struct SessionControl : Abortable {
 	void force() override { shutdown_connection(descriptor, peer); }
 };
 // Runs on the session's loop: tracks the control (its destructor untracks it), then awaits the
-// session as a child. The frame holds the ticket and the control, so a session allocates nothing
-// beyond its frames.
+// session as a child. A session that moves to another loop resumes this frame back on its own
+// (a task's awaiter resumes on its own scheduler), so the control is untracked there. The frame
+// holds the ticket and the control, so a session allocates nothing beyond its frames.
 inline task::task<void> run_session(SessionTicket ticket, const Session* session, asio::ip::tcp::socket socket,
 	asio::ip::tcp::endpoint peer, SessionContext context) {
 	Reactor& reactor = *ticket.reactor;
