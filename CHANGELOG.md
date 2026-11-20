@@ -36,6 +36,10 @@ Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://gith
   `server_context` builds through it. Contexts configured from the same files share the parsed
   objects, with their certificate extensions decoded before they are shared; an encrypted key is
   reused only for the password it was decrypted with. Files over 16 MiB are refused.
+- `tls::configure`'s parse cache keeps a parse only while a context configured from it lives:
+  the context holds its parses and frees them with itself, so the cache holds no entry and no
+  decrypted key once every context using it is gone. Configuring a context after freeing the
+  last one using a file parses that file again. Password digests are cleansed when freed.
 
 ## 2026-11-17
 
