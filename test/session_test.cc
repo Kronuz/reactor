@@ -557,6 +557,43 @@ static void cross_server_stop_orders() {
 	}
 }
 
+// [A] Sessions that end on another server's loop leave their own reactor's abort list on that
+// reactor's loop: a's stop() walks the list while each abort() it runs ends a session on b's loop,
+// so an untrack from b's thread would race the walk (TSan reports it).
+static void cross_loop_untrack() {
+	constexpr int sessions = 32;
+	const auto base = task::detail::live_frames();
+	std::atomic<int> parked{0}, ended{0};
+	auto b = std::make_unique<reactor::TcpServer>(1, 0, [](asio::ip::tcp::socket, Reactor&, SessionContext) -> task::task<void> { co_return; });
+	reactor::BindOptions bind; bind.address = "127.0.0.1";
+	b->set_bind_options(bind);
+	b->start(0);
+	Reactor* other = &b->reactor(0);
+	auto a = std::make_unique<reactor::TcpServer>(1, 0, [&, other](asio::ip::tcp::socket, Reactor&, SessionContext context) -> task::task<void> {
+		co_await task::schedule_on{task::scheduler_ref::of(other->scheduler())};
+		asio::steady_timer timer(other->io(), 1h);
+		++parked;
+		co_await test::wait_timer(timer, context.stop);
+		++ended;   // the session's frame ends on b's loop
+	});
+	a->set_bind_options(bind);
+	a->set_shutdown_grace(2000ms);
+	const auto port = test::free_port();
+	a->start(port);
+	std::vector<int> fds;
+	for (int i = 0; i < sessions; ++i) { fds.push_back(test::connect_port(port)); }
+	wait_for([&] { return parked == sessions; });
+	check(parked == sessions, "[A] a's sessions wait on b's loop");
+	const double took = returns_within("[A] a's stop()", 5000ms, [&] { a->stop(); });
+	check(ended == sessions && took < 1000.0, "[A] a's abort walk ended every session on b's loop, before the grace");
+	b->stop();
+	a->close(); b->close();
+	a->destroy_roots(); b->destroy_roots();
+	check(task::detail::live_frames() == base, "[A] no task frame is left");
+	a.reset(); b.reset();
+	for (int fd : fds) { if (fd >= 0) { ::close(fd); } }
+}
+
 // [O] The phase calls in every order: each subset of stop(), close() and destroy_roots() in each
 // order, then destruction. Each call runs the earlier phases not yet run, so none deadlocks or
 // destroys a root under a running loop, and sessions mid-read with the token end at the stop the
@@ -825,9 +862,15 @@ static void legacy_stop_cancels_at_once() {
 	check(task::detail::live_frames() == base, "[L] no task frame is left");
 }
 
-int main() {
+// `reactor_session_test untrack` runs only [A] (the race check, against a mutant).
+int main(int argc, char** argv) {
 	std::setvbuf(stdout, nullptr, _IOLBF, 0);
 	std::printf("== reactor session test ==\n");
+	if (argc > 1 && std::string(argv[1]) == "untrack") {
+		cross_loop_untrack();
+		std::printf("\n%s (%d failures)\n", g_fail == 0 ? "PASS" : "FAIL", g_fail);
+		return g_fail == 0 ? 0 : 1;
+	}
 	shutdown_mid_read(false);
 #ifdef __linux__
 	shutdown_mid_read(true);
@@ -843,6 +886,7 @@ int main() {
 	tokenless_waits_end_after_grace();
 	force_spares_a_reused_descriptor();
 	cross_server_stop_orders();
+	cross_loop_untrack();
 	phase_orders();
 	stop_accepting_lets_requests_finish();
 	wait_requests_token();
