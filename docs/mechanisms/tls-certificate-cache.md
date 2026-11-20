@@ -8,9 +8,12 @@ and a rotated file is what the next `configure` serves. `server_context` builds 
 
 ## How it works
 
-1. `detail::load` reads the file whole and compares its bytes with the cached entry for
-   `(use, path)`: a certificate chain, a private key, or an authority.
-2. On a match it returns the cached parse. Otherwise `detail::parse` parses the bytes from
+1. `detail::load` reads the file whole (refusing one over 16 MiB) and compares its bytes with the
+   cached entry for `(use, path)`: a certificate chain, a private key, or an authority. One file
+   named for several uses keeps a parse per use.
+2. On a match it returns the cached parse; for an encrypted key, only when the context's password
+   callback supplies the password the entry was decrypted with (compared by SHA-256 digest, kept
+   in memory only). Otherwise `detail::parse` parses the bytes from
    memory as OpenSSL's file loaders do (`SSL_CTX_use_certificate_chain_file`,
    `SSL_CTX_use_PrivateKey_file`, `X509_load_cert_crl_file`), with the context's password
    callback, and the entry is replaced.
@@ -38,7 +41,8 @@ context holding its objects is. Cached bytes are cleansed when freed.
 
 ## Limits
 
-- A key is decrypted with the password callback of the context that first parsed those bytes;
-  later contexts reuse the decrypted key.
+- The cache is unbounded and outlives its contexts: one entry per `(use, path)` for the process,
+  so a decrypted key stays in memory after every context using it is gone, and rotating to new
+  file names (dated paths) keeps one entry per name. A follow-up quest bounds it.
 - `system_roots` still calls `SSL_CTX_set_default_verify_paths`, which parses the system
   bundle on every call.

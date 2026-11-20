@@ -73,6 +73,8 @@ struct Pem {
 	std::vector<X509*> certificates;
 	std::vector<X509_CRL*> revocations;
 	EVP_PKEY* key = nullptr;
+	bool encrypted = false;  // the key's parse asked for a password
+	std::string password;    // that password's SHA-256 digest
 	Pem() = default;
 	Pem(const Pem&) = delete;
 	Pem& operator=(const Pem&) = delete;
@@ -84,6 +86,39 @@ struct Pem {
 	}
 };
 
+// A context's password callback (OpenSSL's default when it has none), recording whether it was
+// asked and the digest of what it supplied.
+struct Password {
+	pem_password_cb* callback;
+	void* data;
+	bool asked = false;
+	std::string digest;
+	static int supply(char* buffer, int size, int rwflag, void* self) {
+		auto& password = *static_cast<Password*>(self);
+		const int n = password.callback ? password.callback(buffer, size, rwflag, password.data) : PEM_def_callback(buffer, size, rwflag, password.data);
+		unsigned char md[EVP_MAX_MD_SIZE];
+		unsigned int length = 0;
+		password.asked = true;
+		password.digest.clear();
+		if (n > 0 && EVP_Digest(buffer, static_cast<std::size_t>(n), md, &length, EVP_sha256(), nullptr) == 1) {
+			password.digest.assign(reinterpret_cast<const char*>(md), length);
+		}
+		OPENSSL_cleanse(md, sizeof md);
+		return n;
+	}
+};
+
+// Whether the context supplies the password an encrypted key entry was decrypted with.
+inline bool same_password(const Pem& pem, SSL_CTX* context) {
+	Password password{SSL_CTX_get_default_passwd_cb(context), SSL_CTX_get_default_passwd_cb_userdata(context)};
+	char buffer[PEM_BUFSIZE];
+	(void)Password::supply(buffer, sizeof buffer, 0, &password);
+	OPENSSL_cleanse(buffer, sizeof buffer);
+	return !password.digest.empty() && password.digest == pem.password;
+}
+
+inline constexpr long max_file_bytes = 16L << 20;
+
 // How a file is parsed: a certificate chain (leaf first), a private key, or an authority's
 // certificates and revocation lists.
 enum class Use { Chain, Key, Authority };
@@ -92,22 +127,29 @@ enum class Use { Chain, Key, Authority };
 	throw std::system_error(asio::error_code(static_cast<int>(ERR_get_error()), asio::error::get_ssl_category()), what);
 }
 
+// The file's bytes, refused past max_file_bytes; sized up front so no grown copy is left uncleansed.
 inline std::string read(const std::string& path, const char* what) {
-	std::FILE* file = std::fopen(path.c_str(), "rb");
+	std::unique_ptr<std::FILE, decltype(&std::fclose)> file(std::fopen(path.c_str(), "rb"), &std::fclose);
 	if (!file) { throw std::system_error(errno, std::generic_category(), what); }
 	std::string bytes;
+	if (std::fseek(file.get(), 0, SEEK_END) == 0) {
+		if (const long size = std::ftell(file.get()); size > 0 && size <= max_file_bytes) { bytes.reserve(static_cast<std::size_t>(size)); }
+		std::rewind(file.get());
+	}
 	char buffer[8192];
-	for (std::size_t n; (n = std::fread(buffer, 1, sizeof buffer, file)) > 0;) { bytes.append(buffer, n); }
-	const bool failed = std::ferror(file) != 0;
-	std::fclose(file);
+	for (std::size_t n; (n = std::fread(buffer, 1, sizeof buffer, file.get())) > 0 && bytes.size() <= std::size_t(max_file_bytes);) { bytes.append(buffer, n); }
 	OPENSSL_cleanse(buffer, sizeof buffer);
-	if (failed) { throw std::system_error(EIO, std::generic_category(), what); }
+	const int error = std::ferror(file.get()) != 0 ? EIO : bytes.size() > std::size_t(max_file_bytes) ? EFBIG : 0;
+	if (error != 0) {
+		OPENSSL_cleanse(bytes.data(), bytes.size());
+		throw std::system_error(error, std::generic_category(), what);
+	}
 	return bytes;
 }
 
 // Parses as OpenSSL's file loaders do (SSL_CTX_use_certificate_chain_file,
 // SSL_CTX_use_PrivateKey_file, X509_load_cert_crl_file), from memory, with the context's
-// password callback. Each certificate's extensions are decoded before it is shared, so
+// password callback, whose digest a key entry keeps when it was asked. Each certificate's extensions are decoded before it is shared, so
 // handshakes on other threads only read them.
 inline std::shared_ptr<const Pem> parse(Use use, std::string bytes, SSL_CTX* context, const char* what) {
 	auto pem = std::make_shared<Pem>();
@@ -126,8 +168,11 @@ inline std::shared_ptr<const Pem> parse(Use use, std::string bytes, SSL_CTX* con
 		if (end != 0 && (ERR_GET_LIB(end) != ERR_LIB_PEM || ERR_GET_REASON(end) != PEM_R_NO_START_LINE)) { ssl_error(what); }
 		ERR_clear_error();
 	} else if (use == Use::Key) {
-		pem->key = PEM_read_bio_PrivateKey(bio.get(), nullptr, password, password_data);
+		Password supplied{password, password_data};
+		pem->key = PEM_read_bio_PrivateKey(bio.get(), nullptr, &Password::supply, &supplied);
 		if (!pem->key) { ssl_error(what); }
+		pem->encrypted = supplied.asked;
+		pem->password = std::move(supplied.digest);
 	} else {
 		STACK_OF(X509_INFO)* infos = PEM_X509_INFO_read_bio(bio.get(), nullptr, nullptr, const_cast<char*>(""));
 		if (!infos) { ssl_error(what); }
@@ -146,18 +191,21 @@ inline std::shared_ptr<const Pem> parse(Use use, std::string bytes, SSL_CTX* con
 	return pem;
 }
 
-// The file's parse: reused while its bytes are those last parsed for this path and use,
-// parsed again (and kept) when they changed.
+// The file's parse: reused while its bytes are those last parsed for this path and use (and,
+// for an encrypted key, the context supplies the same password), parsed again and kept otherwise.
+// The password callback runs outside the lock.
 inline std::shared_ptr<const Pem> load(Use use, const std::string& path, SSL_CTX* context, const char* what) {
 	static std::mutex mutex;
 	static std::map<std::pair<Use, std::string>, std::shared_ptr<const Pem>> cache;
 	std::string bytes = read(path, what);
+	std::shared_ptr<const Pem> cached;
 	{
 		std::lock_guard lock(mutex);
-		if (auto it = cache.find({use, path}); it != cache.end() && it->second->bytes == bytes) {
-			OPENSSL_cleanse(bytes.data(), bytes.size());
-			return it->second;
-		}
+		if (auto it = cache.find({use, path}); it != cache.end() && it->second->bytes == bytes) { cached = it->second; }
+	}
+	if (cached && (!cached->encrypted || same_password(*cached, context))) {
+		OPENSSL_cleanse(bytes.data(), bytes.size());
+		return cached;
 	}
 	auto pem = parse(use, std::move(bytes), context, what);
 	std::lock_guard lock(mutex);

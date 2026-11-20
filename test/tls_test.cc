@@ -24,14 +24,17 @@
 // a certificate out of its dates, and client connections bind IP literals and DNS names but refuse
 // empty names and embedded NULs. Unchanged files load once however many contexts use them; a
 // rotated file is served by the next configure.
-// `reactor_tls_test [basic|server_context|cache|rotation|threads]` runs one part; none runs all.
+// `reactor_tls_test [basic|server_context|cache|rotation|password|combined|race|threads]` runs one
+// part; none runs all.
 #include "reactor_tls.h"
 
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <openssl/pem.h>
 #include <openssl/x509v3.h>
+#include <atomic>
 #include <memory>
 #include <set>
 #include <sys/stat.h>
@@ -256,6 +259,151 @@ static void rotation(const std::string& dir) {
 	for (const std::string& path : {cert, key, ca, a, a_key, b, b_key, c, c_key}) { std::remove(path.c_str()); }
 }
 
+// The key at `from`, written to `to` encrypted with `password`.
+static void encrypt_key(const std::string& from, const std::string& to, const char* password) {
+	FILE* f = std::fopen(from.c_str(), "rb");
+	EVP_PKEY* key = PEM_read_PrivateKey(f, nullptr, nullptr, nullptr);
+	std::fclose(f);
+	f = std::fopen(to.c_str(), "wb");
+	PEM_write_PrivateKey(f, key, EVP_aes_128_cbc(), reinterpret_cast<const unsigned char*>(password), int(std::strlen(password)), nullptr, nullptr);
+	std::fclose(f);
+	EVP_PKEY_free(key);
+}
+
+// An encrypted key loads with the right password only, before and after it is cached; the
+// right password still shares one parse.
+static void password(const std::string& dir) {
+	const std::string cert = dir + "/pw.pem", plain = dir + "/pw-plain.key", key = dir + "/pw.key";
+	self_signed(cert, plain);
+	encrypt_key(plain, key, "right");
+	std::vector<std::shared_ptr<asio::ssl::context>> live;
+	auto with = [&](const char* pw) -> EVP_PKEY* {
+		auto context = std::make_shared<asio::ssl::context>(asio::ssl::context::tls);
+		context->set_password_callback([pw](std::size_t, asio::ssl::context::password_purpose) { return std::string(pw); });
+		try {
+			reactor::tls::configure(*context, Options{cert, key, ""}, Role::Server);
+		} catch (const std::exception&) {
+			return nullptr;
+		}
+		live.push_back(context);
+		return SSL_CTX_get0_privatekey(context->native_handle());
+	};
+	CHECK(with("wrong") == nullptr);
+	EVP_PKEY* first = with("right");
+	CHECK(first != nullptr);
+	CHECK(with("wrong") == nullptr);   // cached, and still refused
+	CHECK(with("") == nullptr);
+	CHECK(with("right") == first);     // cached: one parse
+	for (const std::string& path : {cert, plain, key}) { std::remove(path.c_str()); }
+}
+
+// One file holding a certificate and its key, named as certificate, key and authority: each
+// use keeps its own parse, on a miss and on a hit.
+static void combined(const std::string& dir) {
+	const std::string cert = dir + "/both-cert.pem", key = dir + "/both-key.pem", both = dir + "/both.pem";
+	self_signed(cert, key);
+	{
+		std::ofstream out(both, std::ios::binary);
+		out << std::ifstream(cert, std::ios::binary).rdbuf() << std::ifstream(key, std::ios::binary).rdbuf();
+	}
+	for (int round = 0; round < 2; ++round) {
+		asio::ssl::context server(asio::ssl::context::tls), client(asio::ssl::context::tls), peer(asio::ssl::context::tls),
+			other(asio::ssl::context::tls);
+		CHECK(!invalid([&] { reactor::tls::configure(server, Options{both, both, ""}, Role::Server); }));
+		CHECK(!invalid([&] { reactor::tls::configure(client, Options{"", "", both}, Role::Client); }));
+		CHECK(!invalid([&] { reactor::tls::configure(peer, Options{both, both, both}, Role::Peer); }));
+		CHECK(!invalid([&] { reactor::tls::configure(other, Options{both, both, both}, Role::Peer); }));
+		CHECK(same(presented(server), cert));
+		CHECK(handshake(server, client) == X509_V_OK);
+		CHECK(handshake(peer, other) == X509_V_OK);   // mutual: each presents and verifies
+	}
+	for (const std::string& path : {cert, key, both}) { std::remove(path.c_str()); }
+}
+
+// Four threads configure while a fifth rotates certificate, key and authority by rename
+// through 40 generations, the certificate briefly ahead of its key. Every context that
+// configures presents and trusts a generation no older than the one published when its call
+// began, with a matching key; after the rotation the next configure serves the last one.
+static void race(const std::string& dir) {
+	constexpr int generations = 40;
+	const std::string cert = dir + "/race.pem", key = dir + "/race.key", ca = dir + "/race-ca.pem";
+	std::vector<X509*> certificates;
+	for (int g = 0; g < generations; ++g) {
+		const std::string base = dir + "/race-" + std::to_string(g);
+		self_signed(base + ".pem", base + ".key");
+		FILE* f = std::fopen((base + ".pem").c_str(), "rb");
+		certificates.push_back(PEM_read_X509(f, nullptr, nullptr, nullptr));
+		std::fclose(f);
+	}
+	auto generation = [&](X509* x) {
+		for (int g = 0; g < generations; ++g) {
+			if (x && X509_cmp(x, certificates[g]) == 0) { return g; }
+		}
+		return -1;
+	};
+	auto publish = [&](int g, const char* ext, const std::string& to) {
+		copy(dir + "/race-" + std::to_string(g) + ext, to + ".tmp");
+		std::filesystem::rename(to + ".tmp", to);
+	};
+	publish(0, ".pem", cert);
+	publish(0, ".key", key);
+	publish(0, ".pem", ca);
+	std::atomic<int> version{0};
+	std::atomic<bool> done{false};
+	std::atomic<long> served{0}, wrong{0};
+	std::vector<std::thread> workers;
+	for (int t = 0; t < 4; ++t) {
+		workers.emplace_back([&] {
+			for (int i = 0; !done.load() || i < 5; ++i) {
+				const int before = version.load();
+				asio::ssl::context server(asio::ssl::context::tls), client(asio::ssl::context::tls);
+				bool ok = true;
+				try {
+					reactor::tls::configure(server, Options{cert, key, ""}, Role::Server);
+				} catch (const std::exception&) {
+					ok = false;   // a half-rotated pair
+				}
+				reactor::tls::configure(client, Options{"", "", ca}, Role::Client);
+				const int after = version.load();
+				const auto authority = trusted(client);
+				const int c = authority.size() == 1 ? generation(authority.front()) : -1;
+				wrong += c < before || c > after + 1;
+				if (!ok) { continue; }
+				++served;
+				const int s = generation(presented(server));
+				wrong += s < before || s > after + 1;
+				wrong += X509_check_private_key(presented(server), SSL_CTX_get0_privatekey(server.native_handle())) != 1;
+				wrong += s == c && handshake(server, client) != X509_V_OK;
+			}
+		});
+	}
+	for (int g = 1; g < generations; ++g) {
+		publish(g, ".pem", ca);
+		publish(g, ".pem", cert);
+		std::this_thread::sleep_for(std::chrono::microseconds(200));
+		publish(g, ".key", key);
+		version.store(g);
+		std::this_thread::sleep_for(std::chrono::milliseconds(2));
+	}
+	done.store(true);
+	for (auto& worker : workers) { worker.join(); }
+	asio::ssl::context last(asio::ssl::context::tls), last_client(asio::ssl::context::tls);
+	reactor::tls::configure(last, Options{cert, key, ""}, Role::Server);
+	reactor::tls::configure(last_client, Options{"", "", ca}, Role::Client);
+	CHECK(generation(presented(last)) == generations - 1);
+	const auto authority = trusted(last_client);
+	CHECK(authority.size() == 1 && generation(authority.front()) == generations - 1);
+	CHECK(handshake(last, last_client) == X509_V_OK);
+	CHECK(wrong == 0);
+	CHECK(served > 0);
+	for (X509* x : certificates) { X509_free(x); }
+	for (int g = 0; g < generations; ++g) {
+		std::remove((dir + "/race-" + std::to_string(g) + ".pem").c_str());
+		std::remove((dir + "/race-" + std::to_string(g) + ".key").c_str());
+	}
+	for (const std::string& path : {cert, key, ca}) { std::remove(path.c_str()); }
+}
+
 // Contexts configured on several threads at once from the same files, then handshaking
 // on those threads, share the cached certificates without a race.
 static void threads(const std::string& dir) {
@@ -397,7 +545,8 @@ int main(int argc, char** argv) {
 	const std::string part = argc > 1 ? argv[1] : "";
 	char dir[] = "/tmp/reactor_tls_XXXXXX";
 	CHECK(::mkdtemp(dir) != nullptr);
-	const std::pair<const char*, void (*)(const std::string&)> parts[] = {{"basic", basic}, {"server_context", server_context}, {"cache", cache}, {"rotation", rotation}, {"threads", threads}};
+	const std::pair<const char*, void (*)(const std::string&)> parts[] = {{"basic", basic}, {"server_context", server_context}, {"cache", cache}, {"rotation", rotation}, {"password", password}, {"combined", combined},
+		{"race", race}, {"threads", threads}};
 	bool ran = false;
 	for (auto [name, run] : parts) {
 		if (part.empty() || part == name) {

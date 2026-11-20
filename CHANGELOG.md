@@ -34,7 +34,8 @@ Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://gith
   changed since the last parse of that path: unchanged files load once across every context,
   and a rotated file is served by the next call ([the cache](docs/mechanisms/tls-certificate-cache.md)).
   `server_context` builds through it. Contexts configured from the same files share the parsed
-  objects, with their certificate extensions decoded before they are shared.
+  objects, with their certificate extensions decoded before they are shared; an encrypted key is
+  reused only for the password it was decrypted with. Files over 16 MiB are refused.
 
 ## 2026-11-17
 
