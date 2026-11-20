@@ -21,8 +21,11 @@
  */
 
 // The cost of one reactor::tls::configure on a fresh context, per role and key type, on
-// unchanged files. `bench DIR LABEL [iterations]` writes its certificates into DIR and
-// prints one line per case: LABEL, case, median, p10 and p90 in microseconds.
+// unchanged files. A held case keeps one context configured from the same files alive while
+// it times (a reload building the new context beside the old one, or peers sharing one set of
+// bytes); an unheld case frees each context before configuring the next. `bench DIR LABEL
+// [iterations]` writes its certificates into DIR and prints one line per case: LABEL, case,
+// median, p10 and p90 in microseconds.
 #include "reactor_tls.h"
 
 #include <openssl/pem.h>
@@ -84,6 +87,7 @@ int main(int argc, char** argv) {
 		const char* name;
 		Options options;
 		Role role;
+		bool held = true;
 	};
 	Options roots;
 	roots.system_roots = true;
@@ -93,10 +97,14 @@ int main(int argc, char** argv) {
 		{"client-ca", Options{"", "", ec}, Role::Client},
 		{"peer-ec", Options{ec, ec_key, ec}, Role::Peer},
 		{"client-system-roots", roots, Role::Client},
+		{"server-ec-unheld", Options{ec, ec_key, ""}, Role::Server, false},
+		{"peer-ec-unheld", Options{ec, ec_key, ec}, Role::Peer, false},
 	};
 	for (const Case& c : cases) {
 		std::vector<double> us;
 		us.reserve(iterations);
+		asio::ssl::context holder(asio::ssl::context::tls);
+		if (c.held) { reactor::tls::configure(holder, c.options, c.role); }
 		for (int i = 0; i < iterations; ++i) {
 			asio::ssl::context context(asio::ssl::context::tls);
 			const auto start = std::chrono::steady_clock::now();

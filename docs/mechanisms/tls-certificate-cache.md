@@ -27,6 +27,21 @@ contexts are configured from them while one of them lives, and a rotated file is
    (`detail::hold`), replacing those an earlier `configure` of it left. `SSL_CTX_free` releases
    them; freeing a context's last parse frees its objects and drops its entry.
 
+## When it hits
+
+A `configure` reuses a file's parse when the file's bytes are unchanged and some live context
+was configured from that parse:
+
+1. A reload: the new context is configured while the old one still serves, so unchanged files
+   hit and only the rotated ones are parsed.
+2. Many contexts from one set of bytes, such as peers or per-listener servers: the first parses,
+   the rest hit while any of them lives.
+
+It misses, and parses in full, when the bytes changed, when an encrypted key is configured with
+another password, and when the last context using the file was freed before the next
+`configure`: configure, free, configure parses every time. `docs/perf/tls-configure.md`
+measures both.
+
 ## Why bytes, not modification times
 
 A comparison of the bytes cannot serve a stale file: what a context gets is the parse of what
@@ -54,8 +69,6 @@ context reconfigured from other files keeps working while the parses it left are
 
 ## Limits
 
-- Only a live context keeps a parse: configuring a context, freeing it, and configuring the next
-  parses every time. A server rebuilding its context on rotation reuses the unchanged files'
-  parses because its current context still holds them.
+- Only a live context keeps a parse (see When it hits).
 - `system_roots` still calls `SSL_CTX_set_default_verify_paths`, which parses the system
   bundle on every call.
