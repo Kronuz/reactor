@@ -39,8 +39,8 @@ was configured from that parse:
 
 It misses, and parses in full, when the bytes changed, when an encrypted key is configured with
 another password, and when the last context using the file was freed before the next
-`configure`: configure, free, configure parses every time. `docs/perf/tls-configure.md`
-measures both.
+`configure`: configure, free, configure parses every time. For a P-256 server that is about
+43 µs on a hit and 161 µs on a miss (`docs/perf/tls-configure.md`).
 
 ## Why bytes, not modification times
 
