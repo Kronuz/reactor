@@ -66,6 +66,17 @@ enum class Role { Peer, Server, Client };
 
 namespace detail {
 
+// A password's SHA-256 digest; every copy is cleansed when destroyed.
+struct Digest {
+	unsigned char bytes[32]{};
+	bool set = false;
+	Digest() = default;
+	Digest(const Digest&) = default;
+	Digest& operator=(const Digest&) = default;
+	~Digest() { OPENSSL_cleanse(bytes, sizeof bytes); }
+	bool operator==(const Digest& other) const { return set && other.set && CRYPTO_memcmp(bytes, other.bytes, sizeof bytes) == 0; }
+};
+
 // One PEM file's bytes as last parsed, and what they parsed to. Contexts configured from the
 // same bytes share these objects, which are only read once published.
 struct Pem {
@@ -74,7 +85,7 @@ struct Pem {
 	std::vector<X509_CRL*> revocations;
 	EVP_PKEY* key = nullptr;
 	bool encrypted = false;  // the key's parse asked for a password
-	std::string password;    // that password's SHA-256 digest
+	Digest password;         // that password's digest
 	Pem() = default;
 	Pem(const Pem&) = delete;
 	Pem& operator=(const Pem&) = delete;
@@ -92,18 +103,14 @@ struct Password {
 	pem_password_cb* callback;
 	void* data;
 	bool asked = false;
-	std::string digest;
+	Digest digest;
 	static int supply(char* buffer, int size, int rwflag, void* self) {
 		auto& password = *static_cast<Password*>(self);
 		const int n = password.callback ? password.callback(buffer, size, rwflag, password.data) : PEM_def_callback(buffer, size, rwflag, password.data);
-		unsigned char md[EVP_MAX_MD_SIZE];
 		unsigned int length = 0;
 		password.asked = true;
-		password.digest.clear();
-		if (n > 0 && EVP_Digest(buffer, static_cast<std::size_t>(n), md, &length, EVP_sha256(), nullptr) == 1) {
-			password.digest.assign(reinterpret_cast<const char*>(md), length);
-		}
-		OPENSSL_cleanse(md, sizeof md);
+		password.digest.set = n > 0 && EVP_Digest(buffer, static_cast<std::size_t>(n), password.digest.bytes, &length, EVP_sha256(), nullptr) == 1 &&
+			length == sizeof password.digest.bytes;
 		return n;
 	}
 };
@@ -114,7 +121,7 @@ inline bool same_password(const Pem& pem, SSL_CTX* context) {
 	char buffer[PEM_BUFSIZE];
 	(void)Password::supply(buffer, sizeof buffer, 0, &password);
 	OPENSSL_cleanse(buffer, sizeof buffer);
-	return !password.digest.empty() && password.digest == pem.password;
+	return password.digest == pem.password;
 }
 
 inline constexpr long max_file_bytes = 16L << 20;
@@ -151,8 +158,8 @@ inline std::string read(const std::string& path, const char* what) {
 // SSL_CTX_use_PrivateKey_file, X509_load_cert_crl_file), from memory, with the context's
 // password callback, whose digest a key entry keeps when it was asked. Each certificate's extensions are decoded before it is shared, so
 // handshakes on other threads only read them.
-inline std::shared_ptr<const Pem> parse(Use use, std::string bytes, SSL_CTX* context, const char* what) {
-	auto pem = std::make_shared<Pem>();
+inline std::unique_ptr<Pem> parse(Use use, std::string bytes, SSL_CTX* context, const char* what) {
+	auto pem = std::make_unique<Pem>();
 	pem->bytes = std::move(bytes);
 	std::unique_ptr<BIO, decltype(&BIO_free)> bio(BIO_new_mem_buf(pem->bytes.data(), static_cast<int>(pem->bytes.size())), &BIO_free);
 	if (!bio) { ssl_error(what); }
@@ -172,7 +179,7 @@ inline std::shared_ptr<const Pem> parse(Use use, std::string bytes, SSL_CTX* con
 		pem->key = PEM_read_bio_PrivateKey(bio.get(), nullptr, &Password::supply, &supplied);
 		if (!pem->key) { ssl_error(what); }
 		pem->encrypted = supplied.asked;
-		pem->password = std::move(supplied.digest);
+		pem->password = supplied.digest;
 	} else {
 		STACK_OF(X509_INFO)* infos = PEM_X509_INFO_read_bio(bio.get(), nullptr, nullptr, const_cast<char*>(""));
 		if (!infos) { ssl_error(what); }
@@ -191,33 +198,80 @@ inline std::shared_ptr<const Pem> parse(Use use, std::string bytes, SSL_CTX* con
 	return pem;
 }
 
+// The latest parse of each use and path, while a context holds it (hold()): an entry and its
+// parse go when the last context holding the parse is freed.
+struct Cache {
+	std::mutex mutex;
+	std::map<std::pair<Use, std::string>, std::weak_ptr<const Pem>> entries;
+};
+
+// Never destroyed, so a context freed during static destruction still finds it.
+inline Cache& cache() {
+	static Cache& cache = *new Cache;
+	return cache;
+}
+
+// Frees a parse and drops its entry unless a newer parse replaced it. It locks the cache, so no
+// last reference to a parse is dropped while the cache is locked.
+struct Release {
+	std::pair<Use, std::string> key;
+	void operator()(const Pem* pem) const {
+		{
+			std::lock_guard lock(cache().mutex);
+			if (auto it = cache().entries.find(key); it != cache().entries.end() && it->second.expired()) { cache().entries.erase(it); }
+		}
+		delete pem;
+	}
+};
+
 // The file's parse: reused while its bytes are those last parsed for this path and use (and,
-// for an encrypted key, the context supplies the same password), parsed again and kept otherwise.
-// The password callback runs outside the lock.
+// for an encrypted key, the context supplies the same password) and a live context holds it,
+// parsed again and kept otherwise. The password callback runs outside the lock.
 inline std::shared_ptr<const Pem> load(Use use, const std::string& path, SSL_CTX* context, const char* what) {
-	static std::mutex mutex;
-	static std::map<std::pair<Use, std::string>, std::shared_ptr<const Pem>> cache;
 	std::string bytes = read(path, what);
 	std::shared_ptr<const Pem> cached;
 	{
-		std::lock_guard lock(mutex);
-		if (auto it = cache.find({use, path}); it != cache.end() && it->second->bytes == bytes) { cached = it->second; }
+		std::lock_guard lock(cache().mutex);
+		if (auto it = cache().entries.find({use, path}); it != cache().entries.end()) { cached = it->second.lock(); }
 	}
-	if (cached && (!cached->encrypted || same_password(*cached, context))) {
+	if (cached && cached->bytes == bytes && (!cached->encrypted || same_password(*cached, context))) {
 		OPENSSL_cleanse(bytes.data(), bytes.size());
 		return cached;
 	}
-	auto pem = parse(use, std::move(bytes), context, what);
-	std::lock_guard lock(mutex);
-	cache[{use, path}] = pem;
+	cached.reset();
+	std::shared_ptr<const Pem> pem(parse(use, std::move(bytes), context, what).release(), Release{{use, path}});
+	std::lock_guard lock(cache().mutex);
+	cache().entries[{use, path}] = pem;
 	return pem;
+}
+
+// The parses a context was configured from, freed with the context.
+using Held = std::vector<std::shared_ptr<const Pem>>;
+
+inline void free_held(void*, void* held, CRYPTO_EX_DATA*, int, long, void*) { delete static_cast<Held*>(held); }
+
+inline int held_index() {
+	static const int index = SSL_CTX_get_ex_new_index(0, nullptr, nullptr, nullptr, &free_held);
+	if (index < 0) { ssl_error("SSL_CTX_get_ex_new_index"); }
+	return index;
+}
+
+// Makes `held` what the context holds, replacing what an earlier configure left.
+inline void hold(SSL_CTX* context, Held held) {
+	const int index = held_index();
+	auto next = std::make_unique<Held>(std::move(held));
+	auto* previous = static_cast<Held*>(SSL_CTX_get_ex_data(context, index));
+	if (SSL_CTX_set_ex_data(context, index, next.get()) != 1) { ssl_error("SSL_CTX_set_ex_data"); }
+	(void)next.release();
+	delete previous;
 }
 
 }  // namespace detail
 
 // TLS 1.2 or later, no renegotiation, no 0-RTT data, a 64 KiB certificate-list cap.
 // Every call reads the files; a file is parsed only when its bytes differ from the last
-// parse of that path, so unchanged files load once and a replaced one is served at once.
+// parse of that path a live context holds, so unchanged files load once while a context uses
+// them and a replaced one is served at once. The context holds its parses until it is freed.
 // Throws std::invalid_argument when the options are incomplete for the role or the key
 // does not match the certificate, std::system_error when a file is unreadable or invalid.
 inline void configure(asio::ssl::context& context, const Options& options, Role role) {
@@ -241,6 +295,7 @@ inline void configure(asio::ssl::context& context, const Options& options, Role 
 		SSL_CTX_set_session_cache_mode(context.native_handle(), SSL_SESS_CACHE_OFF);
 	}
 	SSL_CTX* const handle = context.native_handle();
+	detail::Held held;
 	if (!options.certificate.empty()) {
 		const auto chain = detail::load(detail::Use::Chain, options.certificate, handle, "use_certificate_chain_file");
 		const auto key = detail::load(detail::Use::Key, options.private_key, handle, "use_private_key_file");
@@ -253,6 +308,8 @@ inline void configure(asio::ssl::context& context, const Options& options, Role 
 		}
 		if (SSL_CTX_use_PrivateKey(handle, key->key) != 1) { detail::ssl_error("use_private_key_file"); }
 		if (SSL_CTX_check_private_key(handle) != 1) { throw std::invalid_argument("TLS key mismatch"); }
+		held.push_back(chain);
+		held.push_back(key);
 	}
 	if (!options.certificate_authority.empty()) {
 		const auto authority = detail::load(detail::Use::Authority, options.certificate_authority, handle, "load_verify_file");
@@ -264,7 +321,9 @@ inline void configure(asio::ssl::context& context, const Options& options, Role 
 		for (X509_CRL* crl : authority->revocations) {
 			if (X509_STORE_add_crl(store, crl) != 1) { detail::ssl_error("load_verify_file"); }
 		}
+		held.push_back(authority);
 	}
+	detail::hold(handle, std::move(held));
 	if (system_roots) { context.set_default_verify_paths(); }
 	context.set_verify_mode(role == Role::Peer ? asio::ssl::verify_peer | asio::ssl::verify_fail_if_no_peer_cert
 		: role == Role::Client                 ? asio::ssl::verify_peer

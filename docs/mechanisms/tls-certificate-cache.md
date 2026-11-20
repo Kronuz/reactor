@@ -2,24 +2,30 @@
 
 `reactor::tls::configure` (`reactor_tls.h`) reads the certificate, key and authority files on
 every call, and parses a file only when its bytes differ from the last parse of that path for
-that use. Unchanged files therefore load once however many contexts are configured from them,
-and a rotated file is what the next `configure` serves. `server_context` builds through
+that use that a live context still holds. Unchanged files therefore load once however many
+contexts are configured from them while one of them lives, and a rotated file is what the next
+`configure` serves. `server_context` builds through
 `configure`, so a server rebuilding its context on rotation gets the same cache.
 
 ## How it works
 
 1. `detail::load` reads the file whole (refusing one over 16 MiB) and compares its bytes with the
    cached entry for `(use, path)`: a certificate chain, a private key, or an authority. One file
-   named for several uses keeps a parse per use.
+   named for several uses keeps a parse per use. An entry is a weak reference: it finds a parse
+   only while some context holds it.
 2. On a match it returns the cached parse; for an encrypted key, only when the context's password
    callback supplies the password the entry was decrypted with (compared by SHA-256 digest, kept
-   in memory only). Otherwise `detail::parse` parses the bytes from
+   in memory only, in a `Digest` that cleanses itself when destroyed: the entry's copy and the one
+   each `configure` computes to compare). Otherwise `detail::parse` parses the bytes from
    memory as OpenSSL's file loaders do (`SSL_CTX_use_certificate_chain_file`,
    `SSL_CTX_use_PrivateKey_file`, `X509_load_cert_crl_file`), with the context's password
    callback, and the entry is replaced.
 3. `configure` installs the parsed objects by reference: `SSL_CTX_use_certificate`, the chain by
    `SSL_CTX_add1_chain_cert`, `SSL_CTX_use_PrivateKey`, and the authority's certificates and
    revocation lists into the context's store.
+4. The context then holds the parses it was configured from, in its OpenSSL ex_data
+   (`detail::hold`), replacing those an earlier `configure` of it left. `SSL_CTX_free` releases
+   them; freeing a context's last parse frees its objects and drops its entry.
 
 ## Why bytes, not modification times
 
@@ -36,13 +42,20 @@ connections of one context always have. Each certificate's extensions are decode
 (`X509_check_purpose`) before the entry is published, so handshakes on other threads only read
 them; OpenSSL otherwise decodes them on first verification, a write that TSan cannot see order.
 
-Entries live for the process, one per path and use; a replaced entry is freed when the last
-context holding its objects is. Cached bytes are cleansed when freed.
+A parse lives while a context configured from it does, and its entry with it: the cache never
+holds more entries than the live contexts use, and a decrypted key is freed with the last
+context using it, OpenSSL clearing the key material. A replaced parse is freed when the last
+context holding it is. Cached bytes and password digests are cleansed when freed. The cache
+itself is never destroyed, so a context freed during static destruction can still drop its
+entry.
+
+The objects stay valid without the parse: the context holds its own OpenSSL references, so a
+context reconfigured from other files keeps working while the parses it left are freed.
 
 ## Limits
 
-- The cache is unbounded and outlives its contexts: one entry per `(use, path)` for the process,
-  so a decrypted key stays in memory after every context using it is gone, and rotating to new
-  file names (dated paths) keeps one entry per name. A follow-up quest bounds it.
+- Only a live context keeps a parse: configuring a context, freeing it, and configuring the next
+  parses every time. A server rebuilding its context on rotation reuses the unchanged files'
+  parses because its current context still holds them.
 - `system_roots` still calls `SSL_CTX_set_default_verify_paths`, which parses the system
   bundle on every call.

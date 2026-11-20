@@ -23,9 +23,10 @@
 // reactor::tls: incomplete options for each role are refused, server_context refuses a loose key and
 // a certificate out of its dates, and client connections bind IP literals and DNS names but refuse
 // empty names and embedded NULs. Unchanged files load once however many contexts use them; a
-// rotated file is served by the next configure.
-// `reactor_tls_test [basic|server_context|cache|rotation|password|combined|race|threads]` runs one
-// part; none runs all.
+// rotated file is served by the next configure. A parse lives only while a context holds it, and
+// every copy of a password's digest is cleansed.
+// `reactor_tls_test [basic|server_context|cache|rotation|password|combined|race|threads|release|bounded|digest]`
+// runs one part; none runs all.
 #include "reactor_tls.h"
 
 #include <cstdio>
@@ -36,6 +37,8 @@
 #include <openssl/x509v3.h>
 #include <atomic>
 #include <memory>
+#include <mutex>
+#include <new>
 #include <set>
 #include <sys/stat.h>
 #include <thread>
@@ -43,6 +46,7 @@
 #include <utility>
 #include <cstdlib>
 #include <functional>
+#include <type_traits>
 #include <vector>
 
 static int failures = 0;
@@ -427,6 +431,134 @@ static void threads(const std::string& dir) {
 	std::remove(key.c_str());
 }
 
+using reactor::tls::detail::Use;
+
+// How many entries the parse cache keeps, and whether it keeps one for this use and path.
+static std::size_t entries() {
+	std::lock_guard lock(reactor::tls::detail::cache().mutex);
+	return reactor::tls::detail::cache().entries.size();
+}
+static bool cached(Use use, const std::string& path) {
+	std::lock_guard lock(reactor::tls::detail::cache().mutex);
+	return reactor::tls::detail::cache().entries.count({use, path}) != 0;
+}
+static std::weak_ptr<const reactor::tls::detail::Pem> entry(Use use, const std::string& path) {
+	std::lock_guard lock(reactor::tls::detail::cache().mutex);
+	auto it = reactor::tls::detail::cache().entries.find({use, path});
+	return it == reactor::tls::detail::cache().entries.end() ? std::weak_ptr<const reactor::tls::detail::Pem>() : it->second;
+}
+
+// A parse lives while a context configured from it does: freeing the last such context frees the
+// entry and its decrypted key, and a context configured again lets go of the parses it left.
+static void release(const std::string& dir) {
+	const std::string cert = dir + "/rel.pem", plain = dir + "/rel-plain.key", key = dir + "/rel.key", other = dir + "/rel2.pem",
+		other_key = dir + "/rel2.key";
+	self_signed(cert, plain);
+	encrypt_key(plain, key, "secret");
+	self_signed(other, other_key);
+	auto server = [&] {
+		auto context = std::make_shared<asio::ssl::context>(asio::ssl::context::tls);
+		context->set_password_callback([](std::size_t, asio::ssl::context::password_purpose) { return std::string("secret"); });
+		reactor::tls::configure(*context, Options{cert, key, ""}, Role::Server);
+		return context;
+	};
+	auto a = server(), b = server();
+	asio::ssl::context client(asio::ssl::context::tls);
+	reactor::tls::configure(client, Options{"", "", cert}, Role::Client);
+	CHECK(SSL_CTX_get0_privatekey(a->native_handle()) == SSL_CTX_get0_privatekey(b->native_handle()));   // one parse
+	const auto chain = entry(Use::Chain, cert), parsed = entry(Use::Key, key), authority = entry(Use::Authority, cert);
+	CHECK(!chain.expired() && !parsed.expired() && !authority.expired());
+	CHECK(parsed.lock() && parsed.lock()->encrypted);
+	a.reset();
+	CHECK(!chain.expired() && !parsed.expired());   // b still holds them
+	b.reset();
+	CHECK(chain.expired() && parsed.expired());
+	CHECK(!cached(Use::Chain, cert) && !cached(Use::Key, key));
+	CHECK(!authority.expired() && cached(Use::Authority, cert));   // the client still holds its authority
+
+	// Configured again from other files, a context holds only the new parses.
+	reactor::tls::configure(client, Options{"", "", other}, Role::Client);
+	CHECK(authority.expired() && !cached(Use::Authority, cert));
+	CHECK(cached(Use::Authority, other));
+	for (const std::string& path : {cert, plain, key, other, other_key}) { std::remove(path.c_str()); }
+}
+
+// Contexts configured from many distinct paths leave the cache empty once they are freed.
+static void bounded(const std::string& dir) {
+	constexpr int n = 16;
+	const std::size_t before = entries();
+	std::vector<std::shared_ptr<asio::ssl::context>> live;
+	for (int i = 0; i < n; ++i) {
+		const std::string cert = dir + "/bound-" + std::to_string(i) + ".pem", key = dir + "/bound-" + std::to_string(i) + ".key";
+		self_signed(cert, key);
+		auto server = std::make_shared<asio::ssl::context>(asio::ssl::context::tls), client = std::make_shared<asio::ssl::context>(asio::ssl::context::tls);
+		reactor::tls::configure(*server, Options{cert, key, ""}, Role::Server);
+		reactor::tls::configure(*client, Options{"", "", cert}, Role::Client);
+		CHECK(handshake(*server, *client) == X509_V_OK);
+		live.push_back(std::move(server));
+		live.push_back(std::move(client));
+		std::remove(cert.c_str());
+		std::remove(key.c_str());
+	}
+	CHECK(entries() == before + 3 * n);   // a chain, a key and an authority per path
+	live.clear();
+	CHECK(entries() == 0);
+}
+
+// Whether the digest-sized bytes at `at` are all zero, read as raw storage.
+static bool zero(const unsigned char* at) {
+	const volatile unsigned char* p = at;
+	for (std::size_t i = 0; i < sizeof(reactor::tls::detail::Digest::bytes); ++i) {
+		if (p[i] != 0) { return false; }
+	}
+	return true;
+}
+
+// Every holder of a password's digest keeps it as a Digest, so each copy, the context's on every
+// configure and the entry's, is cleansed when freed: the bytes it stood in read zero afterwards.
+static void digest(const std::string&) {
+	using reactor::tls::detail::Digest;
+	using reactor::tls::detail::Password;
+	using reactor::tls::detail::Pem;
+	static_assert(std::is_same_v<decltype(Password::digest), Digest>);
+	static_assert(std::is_same_v<decltype(Pem::password), Digest>);
+	pem_password_cb* secret = [](char* buffer, int, int, void*) {
+		std::memcpy(buffer, "secret", 6);
+		return 6;
+	};
+	char buffer[PEM_BUFSIZE];
+	{
+		alignas(Password) unsigned char storage[sizeof(Password)];
+		auto* password = new (storage) Password{secret, nullptr};
+		CHECK(Password::supply(buffer, sizeof buffer, 0, password) == 6);
+		CHECK(password->digest.set);
+		const unsigned char* at = password->digest.bytes;
+		CHECK(!zero(at));
+		password->~Password();
+		CHECK(zero(at));
+	}
+	{
+		Password supplied{secret, nullptr};
+		(void)Password::supply(buffer, sizeof buffer, 0, &supplied);
+		alignas(Pem) unsigned char storage[sizeof(Pem)];
+		auto* pem = new (storage) Pem;
+		pem->password = supplied.digest;
+		CHECK(pem->password == supplied.digest);
+		const unsigned char* at = pem->password.bytes;
+		CHECK(!zero(at));
+		pem->~Pem();
+		CHECK(zero(at));
+	}
+	{
+		Password one{secret, nullptr}, other{[](char* b, int, int, void*) { b[0] = 'x'; return 1; }, nullptr}, none{nullptr, nullptr};
+		(void)Password::supply(buffer, sizeof buffer, 0, &one);
+		(void)Password::supply(buffer, sizeof buffer, 0, &other);
+		CHECK(!(one.digest == other.digest));
+		CHECK(!(none.digest == none.digest));   // no digest matches nothing
+	}
+	OPENSSL_cleanse(buffer, sizeof buffer);
+}
+
 // The message server_context refuses with, or "" when it accepts.
 static std::string refusal(const std::string& cert, const std::string& key) {
 	try {
@@ -546,7 +678,7 @@ int main(int argc, char** argv) {
 	char dir[] = "/tmp/reactor_tls_XXXXXX";
 	CHECK(::mkdtemp(dir) != nullptr);
 	const std::pair<const char*, void (*)(const std::string&)> parts[] = {{"basic", basic}, {"server_context", server_context}, {"cache", cache}, {"rotation", rotation}, {"password", password}, {"combined", combined},
-		{"race", race}, {"threads", threads}};
+		{"race", race}, {"threads", threads}, {"release", release}, {"bounded", bounded}, {"digest", digest}};
 	bool ran = false;
 	for (auto [name, run] : parts) {
 		if (part.empty() || part == name) {
