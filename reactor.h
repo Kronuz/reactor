@@ -72,6 +72,7 @@ extern "C" void pthread_set_name_np(pthread_t, const char*);
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
@@ -717,33 +718,54 @@ inline task::task<void> shared_accept_loop(std::vector<Reactor*> reactors, const
 
 }  // namespace detail
 
-// Raises the soft open-files limit (RLIMIT_NOFILE) to `wanted`, or as far toward the hard limit as
-// the system allows (macOS also caps it at kern.maxfilesperproc); never lowers it. Returns the soft
-// limit in force, SIZE_MAX for none. A server asks for its connection bound plus its own reserve,
-// before privileges drop, and decides what to do when the answer is short.
-inline std::size_t raise_open_files(std::size_t wanted) {
+namespace detail {
+
+// The soft open-files limit to ask for: `wanted`, clamped to the limit type, the hard limit `max`
+// and `cap` (0 for none), or `cur` when that is no raise. Generic over the limit type because
+// FreeBSD's rlim_t is signed; RLIM_INFINITY is the largest valid value on every platform.
+template <class Limit>
+constexpr Limit open_files_target(std::size_t wanted, Limit cur, Limit max, Limit infinity, Limit cap) noexcept {
+	if (cur == infinity) { return cur; }
+	constexpr Limit top = std::numeric_limits<Limit>::max();
+	Limit target = static_cast<std::uintmax_t>(wanted) > static_cast<std::uintmax_t>(top) ? top : static_cast<Limit>(wanted);
+	target = std::min(target, max);
+	if (cap > 0) { target = std::min(target, cap); }
+	return target > cur ? target : cur;
+}
+
+// raise_open_files, setting the raised limit through `set_limit(const rlimit&)` (a test refuses it).
+template <class SetLimit>
+std::size_t raise_open_files(std::size_t wanted, SetLimit&& set_limit) {
 	const auto in_force = [](rlim_t value) noexcept {
-		return value == RLIM_INFINITY || value > SIZE_MAX ? SIZE_MAX : static_cast<std::size_t>(value);
+		return value == RLIM_INFINITY || static_cast<std::uintmax_t>(value) > SIZE_MAX ? SIZE_MAX : static_cast<std::size_t>(value);
 	};
 	rlimit limit{};
 	if (::getrlimit(RLIMIT_NOFILE, &limit) != 0) { throw std::system_error(errno, std::generic_category(), "getrlimit(RLIMIT_NOFILE)"); }
-	if (limit.rlim_cur == RLIM_INFINITY || static_cast<rlim_t>(wanted) <= limit.rlim_cur) { return in_force(limit.rlim_cur); }
-	rlim_t target = static_cast<rlim_t>(wanted);
-	if (limit.rlim_max != RLIM_INFINITY) { target = std::min(target, limit.rlim_max); }
+	rlim_t cap = 0;
 #if defined(__APPLE__)
 	int per_process = 0;
 	std::size_t size = sizeof(per_process);
-	if (::sysctlbyname("kern.maxfilesperproc", &per_process, &size, nullptr, 0) == 0 && per_process > 0) {
-		target = std::min(target, static_cast<rlim_t>(per_process));
-	}
+	if (::sysctlbyname("kern.maxfilesperproc", &per_process, &size, nullptr, 0) == 0 && per_process > 0) { cap = static_cast<rlim_t>(per_process); }
 #endif
+	const rlim_t target = open_files_target<rlim_t>(wanted, limit.rlim_cur, limit.rlim_max, RLIM_INFINITY, cap);
 	if (target > limit.rlim_cur) {
 		rlimit raised = limit;
 		raised.rlim_cur = target;
-		(void)::setrlimit(RLIMIT_NOFILE, &raised);   // refused: the limit in force stays, and is returned
+		(void)set_limit(raised);   // refused: the limit in force stays, and is returned
 		if (::getrlimit(RLIMIT_NOFILE, &limit) != 0) { throw std::system_error(errno, std::generic_category(), "getrlimit(RLIMIT_NOFILE)"); }
 	}
 	return in_force(limit.rlim_cur);
+}
+
+}  // namespace detail
+
+// Raises the soft open-files limit (RLIMIT_NOFILE) to `wanted`, or as far toward the hard limit as
+// the system allows (macOS and FreeBSD also cap it at kern.maxfilesperproc); never lowers it. SIZE_MAX
+// asks for all of it. Returns the soft limit in force, SIZE_MAX for none. A server asks for its
+// connection bound plus its own reserve, before privileges drop, and decides what to do when the
+// answer is short.
+inline std::size_t raise_open_files(std::size_t wanted) {
+	return detail::raise_open_files(wanted, [](const rlimit& limit) { return ::setrlimit(RLIMIT_NOFILE, &limit); });
 }
 
 // A TCP server: N reactors on N threads, all bound to one port, running the Session

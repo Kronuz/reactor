@@ -84,6 +84,11 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	add_test(NAME reactor COMMAND reactor_test)
 	set_tests_properties(reactor PROPERTIES TIMEOUT 60)
 
+	add_executable(reactor_limits_test test/limits_test.cc)
+	target_link_libraries(reactor_limits_test PRIVATE reactor)
+	add_test(NAME reactor_limits COMMAND reactor_limits_test)
+	set_tests_properties(reactor_limits PROPERTIES TIMEOUT 20)
+
 	add_executable(reactor_session_test test/session_test.cc)
 	target_link_libraries(reactor_session_test PRIVATE reactor)
 	add_test(NAME reactor_session COMMAND reactor_session_test)

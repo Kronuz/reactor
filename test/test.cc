@@ -4,7 +4,6 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
-#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <fcntl.h>
@@ -369,40 +368,6 @@ static void destroy_claimed_loop_asserts() {
 #endif
 }
 
-// [R] raise_open_files raises the soft limit to what is wanted, never past the hard limit and
-// never down, and returns the limit in force. In a child before any thread starts: it lowers the
-// hard limit, which a process cannot undo.
-static void raise_open_files() {
-	std::fflush(stdout);
-	const pid_t child = ::fork();
-	if (child == 0) {
-		int failed = 0;
-		const auto soft = [] { rlimit l{}; ::getrlimit(RLIMIT_NOFILE, &l); return l.rlim_cur; };
-		rlimit l{};
-		::getrlimit(RLIMIT_NOFILE, &l);
-		if (l.rlim_max != RLIM_INFINITY && l.rlim_max < 2048) { std::_Exit(77); }   // no room above 1024 to test
-		l.rlim_cur = 1024;
-		if (::setrlimit(RLIMIT_NOFILE, &l) != 0) { std::_Exit(77); }
-		std::size_t got = reactor::raise_open_files(2000);
-		if (got != 2000 || soft() != 2000) { std::fprintf(stderr, "  raise to 2000 under a soft 1024: %zu\n", got); failed |= 1; }
-		got = reactor::raise_open_files(1500);
-		if (got != 2000 || soft() != 2000) { std::fprintf(stderr, "  wanted below the soft limit: %zu\n", got); failed |= 2; }
-		l.rlim_cur = 1024; l.rlim_max = 1800;
-		if (::setrlimit(RLIMIT_NOFILE, &l) != 0) { std::_Exit(77); }
-		got = reactor::raise_open_files(4000);
-		if (got != 1800 || soft() != 1800) { std::fprintf(stderr, "  wanted past the hard 1800: %zu\n", got); failed |= 4; }
-		std::_Exit(failed);
-	}
-	int status = 0;
-	::waitpid(child, &status, 0);
-	const int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-	if (code == 77) { std::printf("  [R] skipped: the hard open-files limit leaves no room above 1024\n"); return; }
-	check(code >= 0 && (code & 1) == 0,
-		"[R] a soft limit of 1024 under a higher hard limit is raised to the 2000 wanted, and returned");
-	check(code >= 0 && (code & 2) == 0, "[R] a wanted count below the soft limit leaves it, never lowers it");
-	check(code >= 0 && (code & 4) == 0, "[R] a wanted count past the hard limit (1800) raises the soft limit to it");
-}
-
 // Open descriptors of this process.
 static int open_descriptors() {
 	int count = 0;
@@ -487,7 +452,6 @@ int main() {
 	std::setvbuf(stdout, nullptr, _IOLBF, 0);   // a hung run still shows how far it got
 	std::printf("== reactor runtime test ==\n");
 	destroy_claimed_loop_asserts();
-	raise_open_files();
 
 	// [A] one reactor, many clients.
 	{
