@@ -39,6 +39,7 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <optional>
 #include <set>
 #include <sys/stat.h>
 #include <thread>
@@ -570,6 +571,21 @@ static std::string refusal(const std::string& cert, const std::string& key) {
 }
 static bool contains(const std::string& text, const char* part) { return text.find(part) != std::string::npos; }
 
+// seconds_to_expiry of a context presenting the certificate at `path`, its notAfter replaced by
+// the bytes `not_after` when given (an unreadable time).
+static std::optional<long> expiry_of(const std::string& path, const char* not_after) {
+	FILE* f = std::fopen(path.c_str(), "rb");
+	X509* x = f ? PEM_read_X509(f, nullptr, nullptr, nullptr) : nullptr;
+	if (f) { std::fclose(f); }
+	if (x == nullptr) { return 1L << 40; }   // fails the caller's checks
+	if (not_after) { ASN1_STRING_set(X509_getm_notAfter(x), not_after, -1); }
+	asio::ssl::context context(asio::ssl::context::tls);
+	const bool used = SSL_CTX_use_certificate(context.native_handle(), x) == 1;
+	X509_free(x);
+	if (!used) { return 1L << 40; }
+	return reactor::tls::seconds_to_expiry(context);
+}
+
 // server_context: Xapiand's startup checks (the key's mode, the validity dates, the pair) and strict;
 // seconds_to_expiry against the certificate's notAfter and the 14-day warning.
 static void server_context(const std::string& dir) {
@@ -586,9 +602,9 @@ static void server_context(const std::string& dir) {
 		reactor::tls::configure(client, reactor::tls::Options{"", "", cert}, reactor::tls::Role::Client);
 		CHECK(handshake(*context, client, "ECDHE-ECDSA-AES128-GCM-SHA256") == X509_V_OK);
 		CHECK(handshake(*context, client, "ECDHE-ECDSA-AES128-SHA") == -1);   // CBC refused: strict
-		const long left = reactor::tls::seconds_to_expiry(*context);
-		CHECK(left > 3500 && left <= 3600);
-		CHECK(std::chrono::seconds(left) < reactor::tls::expiry_warning);
+		const auto left = reactor::tls::seconds_to_expiry(*context);
+		CHECK(left && *left > 3500 && *left <= 3600);
+		CHECK(left && std::chrono::seconds(*left) < reactor::tls::expiry_warning);
 	}
 	::chmod(key.c_str(), 0640);
 	CHECK(contains(refusal(cert, key), "make it mode 0600"));   // group-readable
@@ -603,18 +619,29 @@ static void server_context(const std::string& dir) {
 	const std::string future = dir + "/future.pem", future_key = dir + "/future.key";
 	self_signed(future, future_key, false, 3600, 7200);
 	CHECK(contains(refusal(future, future_key), "is not valid yet"));
-	// Thirty days left: past the warning. A context with no certificate has 0 left.
+	// Thirty days left: past the warning. A context with no certificate has none.
 	const std::string month = dir + "/month.pem", month_key = dir + "/month.key";
 	self_signed(month, month_key, false, 0, 30L * 86400);
 	{
 		const auto context = reactor::tls::server_context(reactor::tls::Options{month, month_key, ""});
-		const long left = reactor::tls::seconds_to_expiry(*context);
-		CHECK(left > 30L * 86400 - 100 && left <= 30L * 86400);
-		CHECK(std::chrono::seconds(left) >= reactor::tls::expiry_warning);
+		const auto left = reactor::tls::seconds_to_expiry(*context);
+		CHECK(left && *left > 30L * 86400 - 100 && *left <= 30L * 86400);
+		CHECK(left && std::chrono::seconds(*left) >= reactor::tls::expiry_warning);
 		asio::ssl::context empty(asio::ssl::context::tls);
-		CHECK(reactor::tls::seconds_to_expiry(empty) == 0);
+		CHECK(!reactor::tls::seconds_to_expiry(empty));
 	}
-	for (const auto& path : {cert, key, other_cert, other_key, expired, expired_key, future, future_key, month, month_key}) { std::remove(path.c_str()); }
+	// Expiring now reads 0 (or -1 past a second boundary); an unreadable notAfter reads nullopt.
+	const std::string now = dir + "/now.pem", now_key = dir + "/now.key";
+	self_signed(now, now_key, false, -3600, 0);
+	{
+		const auto left = expiry_of(now, nullptr);
+		std::printf("  expiring now: %s %ld\n", left ? "seconds" : "nullopt", left.value_or(0));
+		CHECK(left && *left <= 0 && *left >= -1);
+		const auto unreadable = expiry_of(now, "not a time");
+		std::printf("  unreadable notAfter: %s\n", unreadable ? "seconds" : "nullopt");
+		CHECK(!unreadable);
+	}
+	for (const auto& path : {cert, key, other_cert, other_key, expired, expired_key, future, future_key, month, month_key, now, now_key}) { std::remove(path.c_str()); }
 }
 
 static void basic(const std::string& dir_name) {

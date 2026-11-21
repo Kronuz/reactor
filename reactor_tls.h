@@ -40,6 +40,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -374,11 +375,12 @@ inline std::shared_ptr<asio::ssl::context> server_context(Options options) {
 	return context;
 }
 
-// Seconds until the certificate `context` presents expires, negative once it has; 0 without one.
-inline long seconds_to_expiry(asio::ssl::context& context) {
+// Seconds until the certificate `context` presents expires: 0 as it expires, negative once it has;
+// nullopt without a certificate or with an unreadable notAfter.
+inline std::optional<long> seconds_to_expiry(asio::ssl::context& context) {
 	const X509* presented = SSL_CTX_get0_certificate(context.native_handle());
 	long left = 0;
-	if (presented == nullptr || !detail::seconds_until(X509_get0_notAfter(presented), left)) { return 0; }
+	if (presented == nullptr || !detail::seconds_until(X509_get0_notAfter(presented), left)) { return std::nullopt; }
 	return left;
 }
 
