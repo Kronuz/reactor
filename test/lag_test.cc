@@ -189,6 +189,8 @@ int main() {
 		reactor::LagProbe probe(task::scheduler_ref::of(clock));
 		constexpr std::uint64_t ms = 1'000'000, us = 1'000;
 		probe.start();
+		clock.run();   // runs the posted arm: an inline_scheduler has no runs_here
+		check(clock.armed_timers() == 1, "start() arms the probe once the clock runs its posts");
 		clock.advance(100 * ms - ms / 2);
 		check(probe.snapshot().wakes == 0, "the idle wake, aimed at 100 ms, has not run at 99.5 ms");
 		clock.advance(ms / 2 + 700 * us);
@@ -208,6 +210,7 @@ int main() {
 		std::printf("     busy: %llu wakes in 10 manual ms\n", (unsigned long long)busy);
 		check(busy == 10, "busy, the manual clock wakes the probe once a millisecond");
 		probe.stop();
+		clock.run();   // runs the posted cancel
 		clock.advance(10 * ms);
 		check(probe.snapshot().wakes == before + busy, "stop() ends the manual wakes");
 		check(clock.armed_timers() == 0, "no entry is left on the wheel");

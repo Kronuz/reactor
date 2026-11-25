@@ -6,6 +6,14 @@ entries are dated.
 
 Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://github.com/Kronuz/cpp-libraries/blob/main/docs/UPGRADING-2026-10.md#reactor) lists what changes for callers, how to find affected inputs, the commits not to pin, and the speedup.
 
+## 2026-11-24
+
+### Changed
+
+- The task pin moves to task:477a7d3. Its `inline_scheduler` takes `post_call` (task:627aca3) and
+  has no `runs_here`, so on it `LagProbe::start()` and `stop()` post the arm and the cancel, which
+  run in the scheduler's next `run()`, as from another thread; before, they ran at once.
+
 ## 2026-11-19
 
 ### Added

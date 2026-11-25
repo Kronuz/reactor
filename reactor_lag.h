@@ -118,7 +118,8 @@ public:
 	LagProbe& operator=(const LagProbe&) = delete;
 
 	// Arms the wake at the idle interval; the first wake picks the interval from the activity seen.
-	// On the loop thread it arms at once; from another thread the arm is posted to the loop.
+	// On the loop thread it arms at once; from another thread, or on a scheduler that cannot tell
+	// (no runs_here, as task::inline_scheduler), the arm is posted to the loop when it takes post_call.
 	void start() {
 		if (state_.started.exchange(true)) { return; }
 		if (!state_.scheduler.runs_here() && state_.scheduler.post_call(&State::start_on_loop, &state_)) { return; }

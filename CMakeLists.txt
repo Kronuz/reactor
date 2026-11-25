@@ -31,9 +31,9 @@ if(ASIO_INCLUDE_DIR STREQUAL "")
 endif()
 
 # --- task (cancellable coroutines; the Session type and the loops' scheduler) ---
-# The one place the pin lives: task main with its timers on Kronuz/wheel (task:18eb516).
+# The one place the pin lives: task main with its timers on Kronuz/wheel (task:477a7d3).
 # Set FETCHCONTENT_SOURCE_DIR_TASK to build against a local checkout instead.
-FetchContent_Declare(task GIT_REPOSITORY https://github.com/Kronuz/task.git GIT_TAG 18eb51672e4f306aac508bd0444f6d367eac4291)
+FetchContent_Declare(task GIT_REPOSITORY https://github.com/Kronuz/task.git GIT_TAG 477a7d3f15a8951f2047616b834753177d838a8b)
 FetchContent_MakeAvailable(task)
 
 # --- the reactor runtime (header-only) ---
